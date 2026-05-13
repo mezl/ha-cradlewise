@@ -210,6 +210,25 @@ class CradlewiseVideoReceiver:
             await self._pc.close()
             self._pc = None
 
+    async def _schedule_reconnect(self) -> None:
+        """Re-request a stream offer after a short delay."""
+        _LOGGER.info("WebRTC session ended — reconnecting in 8s (cradle=%s)", self._cradle_id)
+        await asyncio.sleep(8)
+        if not self._running:
+            return
+        await self._reset_pc()
+        self._session_id = str(int(time.time() * 1000))
+        self._publish({
+            "command": "getOffer",
+            "direction": "play",
+            "streamInfo": {
+                "applicationName": _APP_NAME,
+                "sessionId": self._session_id,
+                "streamName": self._client_id,
+            },
+            "userData": {"param1": "value1"},
+        })
+
     async def _handle_offer(self, data: dict) -> None:
         try:
             await self._reset_pc()
@@ -228,7 +247,10 @@ class CradlewiseVideoReceiver:
 
             @pc.on("connectionstatechange")
             async def on_state():
-                _LOGGER.debug("WebRTC %s state: %s", self._cradle_id, pc.connectionState)
+                state = pc.connectionState
+                _LOGGER.debug("WebRTC %s state: %s", self._cradle_id, state)
+                if state in ("failed", "closed") and self._running:
+                    asyncio.ensure_future(self._schedule_reconnect())
 
             await pc.setRemoteDescription(
                 RTCSessionDescription(sdp=sdp_data["sdp"], type=sdp_data["type"])
