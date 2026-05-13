@@ -7,6 +7,6 @@
   "documentation": "https://github.com/custom-components/cradlewise",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/custom-components/cradlewise/issues",
-  "requirements": ["pycradlewise==0.3.1"],
-  "version": "0.3.1"
+  "requirements": ["pycradlewise==0.3.1", "aiortc==1.14.0", "paho-mqtt==2.1.0"],
+  "version": "0.4.0"
 }

@@ -16,7 +16,7 @@ from pycradlewise import (
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 
-from .const import CONF_EMAIL, CONF_PASSWORD, DOMAIN
+from .const import CONF_EMAIL, CONF_LOCAL_HOST, CONF_PASSWORD, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,6 +24,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_EMAIL): str,
         vol.Required(CONF_PASSWORD): str,
+        vol.Optional(CONF_LOCAL_HOST): str,
     }
 )
 
