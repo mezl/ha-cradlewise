@@ -1,122 +1,20 @@
-"""Binary sensor entities for Cradlewise."""
-
+"""Cradlewise binary sensors."""
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any
-
-from pycradlewise import CradlewiseCradle
-
-from homeassistant.components.binary_sensor import (
-    BinarySensorDeviceClass,
-    BinarySensorEntity,
-    BinarySensorEntityDescription,
-)
+from homeassistant.components.binary_sensor import BinarySensorEntity, BinarySensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import DOMAIN, CRADLE_ID
 from .coordinator import CradlewiseCoordinator
-from .sensor import _device_info
 
-
-@dataclass(frozen=True, kw_only=True)
-class CradlewiseBinarySensorEntityDescription(BinarySensorEntityDescription):
-    value_fn: Callable[[CradlewiseCradle], bool | None]
-
-
-BINARY_SENSOR_DESCRIPTIONS: tuple[CradlewiseBinarySensorEntityDescription, ...] = (
-    CradlewiseBinarySensorEntityDescription(
-        key="online",
-        translation_key="online",
-        device_class=BinarySensorDeviceClass.CONNECTIVITY,
-        value_fn=lambda c: c.online,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="baby_present",
-        translation_key="baby_present",
-        device_class=BinarySensorDeviceClass.OCCUPANCY,
-        icon="mdi:baby-face-outline",
-        value_fn=lambda c: c.baby_present,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="baby_needs_attention",
-        translation_key="baby_needs_attention",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:alert-circle-outline",
-        value_fn=lambda c: c.baby_needs_attention,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="baby_needs_help",
-        translation_key="baby_needs_help",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:alert",
-        value_fn=lambda c: c.baby_needs_help,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="crib_helping",
-        translation_key="crib_helping",
-        icon="mdi:hand-heart",
-        value_fn=lambda c: c.is_crib_helping,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="bouncing",
-        translation_key="bouncing",
-        icon="mdi:arrow-up-down-bold",
-        value_fn=lambda c: c.bouncing,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="music_playing",
-        translation_key="music_playing",
-        icon="mdi:music",
-        value_fn=lambda c: c.music_playing,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="light_on",
-        translation_key="light_on",
-        icon="mdi:lightbulb",
-        value_fn=lambda c: c.light_on,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="loud_sound_detected",
-        translation_key="loud_sound_detected",
-        device_class=BinarySensorDeviceClass.SOUND,
-        icon="mdi:volume-high",
-        value_fn=lambda c: c.loud_sound_detected,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="inside_sleep_schedule",
-        translation_key="inside_sleep_schedule",
-        icon="mdi:calendar-clock",
-        value_fn=lambda c: c.inside_sleep_schedule,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="inside_soothing_window",
-        translation_key="inside_soothing_window",
-        icon="mdi:clock-check",
-        value_fn=lambda c: c.inside_soothing_window,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="rocking_not_effective",
-        translation_key="rocking_not_effective",
-        icon="mdi:alert-outline",
-        value_fn=lambda c: c.rocking_not_effective,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="charging",
-        translation_key="charging",
-        device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
-        value_fn=lambda c: c.charging,
-    ),
-    CradlewiseBinarySensorEntityDescription(
-        key="power_supply_removed",
-        translation_key="power_supply_removed",
-        device_class=BinarySensorDeviceClass.PLUG,
-        value_fn=lambda c: not c.supply_removed if c.supply_removed is not None else None,
-    ),
+_DEVICE_INFO = DeviceInfo(
+    identifiers={(DOMAIN, CRADLE_ID)},
+    manufacturer="Cradlewise",
+    model="Smart Crib",
+    name="Cradlewise avo",
 )
 
 
@@ -125,41 +23,167 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator: CradlewiseCoordinator = entry.runtime_data
+    coord: CradlewiseCoordinator = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities([
+        OnlineSensor(coord),
+        BabyPresent(coord),
+        BabyNeedsAttention(coord),
+        BabyNeedsHelp(coord),
+        CribSoothing(coord),
+        Bouncing(coord),
+        MusicPlaying(coord),
+        NightLight(coord),
+        LoudSoundDetected(coord),
+        InSleepSchedule(coord),
+        InSoothingWindow(coord),
+        RockingNotEffective(coord),
+    ])
 
-    entities: list[CradlewiseBinarySensor] = []
-    for cradle in coordinator.cradles.values():
-        for desc in BINARY_SENSOR_DESCRIPTIONS:
-            entities.append(CradlewiseBinarySensor(coordinator, cradle, desc))
 
-    async_add_entities(entities)
+class _Base(BinarySensorEntity):
+    _attr_should_poll = False
 
+    def __init__(self, coord: CradlewiseCoordinator) -> None:
+        self._coord = coord
+        self._unsub = None
 
-class CradlewiseBinarySensor(
-    CoordinatorEntity[CradlewiseCoordinator], BinarySensorEntity
-):
-    entity_description: CradlewiseBinarySensorEntityDescription
-    _attr_has_entity_name = True
+    async def async_added_to_hass(self) -> None:
+        self._unsub = self._coord.async_add_listener(self._on_update)
 
-    def __init__(
-        self,
-        coordinator: CradlewiseCoordinator,
-        cradle: CradlewiseCradle,
-        description: CradlewiseBinarySensorEntityDescription,
-    ) -> None:
-        super().__init__(coordinator)
-        self.entity_description = description
-        self._cradle_id = cradle.cradle_id
-        self._attr_unique_id = f"{cradle.cradle_id}_{description.key}"
-        self._attr_device_info = _device_info(cradle)
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub:
+            self._unsub()
 
-    @property
-    def is_on(self) -> bool | None:
-        cradle = self.coordinator.cradles.get(self._cradle_id)
-        if cradle is None:
-            return None
-        return self.entity_description.value_fn(cradle)
+    @callback
+    def _on_update(self) -> None:
+        self.async_write_ha_state()
 
     @property
     def available(self) -> bool:
-        return self.coordinator.cradles.get(self._cradle_id) is not None and super().available
+        return self._coord.available
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return _DEVICE_INFO
+
+
+class OnlineSensor(_Base):
+    _attr_name = "Online"
+    _attr_unique_id = f"{CRADLE_ID}_online"
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+
+    @property
+    def is_on(self) -> bool:
+        return self._coord.available
+
+
+class BabyPresent(_Base):
+    _attr_name = "Baby Present"
+    _attr_unique_id = f"{CRADLE_ID}_baby_present"
+    _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
+    _attr_icon = "mdi:baby"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.state.get("babyPresent"))
+
+
+class BabyNeedsAttention(_Base):
+    _attr_name = "Baby Needs Attention"
+    _attr_unique_id = f"{CRADLE_ID}_baby_needs_attention"
+    _attr_icon = "mdi:alert"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.state.get("attentionRequired"))
+
+
+class BabyNeedsHelp(_Base):
+    _attr_name = "Baby Needs Help"
+    _attr_unique_id = f"{CRADLE_ID}_baby_needs_help"
+    _attr_icon = "mdi:help-circle"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.state.get("babyNeedsHelp"))
+
+
+class CribSoothing(_Base):
+    _attr_name = "Crib Soothing"
+    _attr_unique_id = f"{CRADLE_ID}_crib_helping"
+    _attr_icon = "mdi:baby-carriage"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.state.get("isCribHelping"))
+
+
+class Bouncing(_Base):
+    _attr_name = "Bouncing"
+    _attr_unique_id = f"{CRADLE_ID}_bouncing"
+    _attr_icon = "mdi:baby-carriage"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.get_actuator().get("on"))
+
+
+class MusicPlaying(_Base):
+    _attr_name = "Music Playing"
+    _attr_unique_id = f"{CRADLE_ID}_music_playing"
+    _attr_icon = "mdi:music"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.get_sound().get("play"))
+
+
+class NightLight(_Base):
+    _attr_name = "Night Light"
+    _attr_unique_id = f"{CRADLE_ID}_light_on"
+    _attr_icon = "mdi:led-on"
+
+    @property
+    def is_on(self) -> bool:
+        return int(self._coord.get_light().get("indicatorBrightness", 0)) > 0
+
+
+class LoudSoundDetected(_Base):
+    _attr_name = "Loud Sound Detected"
+    _attr_unique_id = f"{CRADLE_ID}_loud_sound_detected"
+    _attr_device_class = BinarySensorDeviceClass.SOUND
+    _attr_icon = "mdi:volume-high"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.state.get("loudSoundDetected"))
+
+
+class InSleepSchedule(_Base):
+    _attr_name = "In Sleep Schedule"
+    _attr_unique_id = f"{CRADLE_ID}_inside_sleep_schedule"
+    _attr_icon = "mdi:calendar-clock"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.state.get("insideSleepSchedule"))
+
+
+class InSoothingWindow(_Base):
+    _attr_name = "In Soothing Window"
+    _attr_unique_id = f"{CRADLE_ID}_inside_soothing_window"
+    _attr_icon = "mdi:clock-check"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.state.get("insideSoothingWindow"))
+
+
+class RockingNotEffective(_Base):
+    _attr_name = "Rocking Not Effective"
+    _attr_unique_id = f"{CRADLE_ID}_rocking_not_effective"
+    _attr_icon = "mdi:alert-circle"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.state.get("rockingNotEffective"))

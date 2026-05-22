@@ -1,1 +1,8 @@
-__pycache__/\n*.pyc
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+custom_components/cradlewise/certs/client.pem
+custom_components/cradlewise/certs/client.key
+custom_components/cradlewise/certs/amazon_root_ca1.pem
+.env
