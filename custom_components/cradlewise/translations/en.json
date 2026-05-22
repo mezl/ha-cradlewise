@@ -6,7 +6,8 @@
         "description": "Enter your Cradlewise account credentials (same email and password you use in the Cradlewise app).\n\n**Initial setup may take several minutes** while configuration is downloaded. Please be patient.",
         "data": {
           "email": "Email",
-          "password": "Password"
+          "password": "Password",
+          "local_host": "Crib LAN IP (optional, for live video)"
         }
       }
     },
@@ -42,6 +43,9 @@
       "last_nap_start": { "name": "Last nap started" },
       "last_nap_end": { "name": "Last nap ended" },
       "last_event": { "name": "Last sleep event" }
+    },
+    "camera": {
+      "camera": { "name": "Camera" }
     },
     "binary_sensor": {
       "online": { "name": "Online" },
