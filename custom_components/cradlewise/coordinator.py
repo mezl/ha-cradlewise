@@ -1,128 +1,158 @@
-"""DataUpdateCoordinator for Cradlewise."""
-
+"""MQTT coordinator for Cradlewise — paho-mqtt 1.6.1 API."""
 from __future__ import annotations
 
+import json
 import logging
-from datetime import timedelta
-from typing import Any
+import ssl
+import threading
+from pathlib import Path
+from typing import Any, Callable
 
-from pycradlewise import (
-    AppConfig,
-    CradlewiseApiError,
-    CradlewiseClient,
-    CradlewiseCradle,
-    CradlewiseMqtt,
-    SleepAnalytics,
+import paho.mqtt.client as mqtt
+
+from .const import (
+    CRADLE_ID, HOST, PORT,
+    SHADOW_GET, SHADOW_GET_ACC,
+    SHADOW_UPDATE, SHADOW_UPD_ACC, SHADOW_UPD_REJ, SHADOW_DELTA,
 )
-
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, MQTT_SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
+CERTS_DIR = Path(__file__).parent / "certs"
 
-class CradlewiseCoordinator(DataUpdateCoordinator[dict[str, CradlewiseCradle]]):
-    """Coordinator to manage fetching Cradlewise data."""
 
-    def __init__(
-        self, hass: HomeAssistant, client: CradlewiseClient, app_config: AppConfig
-    ) -> None:
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_interval=timedelta(seconds=DEFAULT_SCAN_INTERVAL),
+class CradlewiseCoordinator:
+    """Manages a single persistent MQTT connection to AWS IoT Core."""
+
+    def __init__(self, hass) -> None:
+        self.hass = hass
+        self.state: dict[str, Any] = {}
+        self.available = False
+        self._listeners: list[Callable] = []
+        self._client: mqtt.Client | None = None
+        self._stop_event = threading.Event()
+
+    # ── Listener management ──────────────────────────────────────────────
+
+    def async_add_listener(self, cb: Callable) -> Callable:
+        """Register a state-change listener; returns an unsubscribe function."""
+        self._listeners.append(cb)
+        def _remove():
+            self._listeners.remove(cb)
+        return _remove
+
+    def _notify(self) -> None:
+        for cb in list(self._listeners):
+            self.hass.add_job(cb)
+
+    # ── Connection ───────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        ctx = ssl.create_default_context(
+            ssl.Purpose.SERVER_AUTH,
+            cafile=str(CERTS_DIR / "amazon_root_ca1.pem"),
         )
-        self.client = client
-        self._app_config = app_config
-        self.cradles: dict[str, CradlewiseCradle] = {}
-        self.analytics: dict[str, SleepAnalytics] = {}
-        self._mqtt = CradlewiseMqtt()
-        self._mqtt_started = False
+        ctx.load_cert_chain(
+            certfile=str(CERTS_DIR / "client.pem"),
+            keyfile=str(CERTS_DIR / "client.key"),
+        )
+        ctx.check_hostname = False
 
-    @property
-    def mqtt_connected(self) -> bool:
-        return self._mqtt.available
+        client = mqtt.Client(client_id="cradlewise-ha")
+        client.tls_set_context(ctx)
+        client.on_connect    = self._on_connect
+        client.on_message    = self._on_message
+        client.on_disconnect = self._on_disconnect
 
-    async def _async_setup(self) -> None:
-        try:
-            self.cradles = await self.client.discover_cradles()
-        except CradlewiseApiError as err:
-            raise UpdateFailed(f"Failed to discover cradles: {err}") from err
+        self._client = client
+        _LOGGER.debug("Connecting to %s:%s", HOST, PORT)
+        client.connect_async(HOST, PORT, keepalive=30)
+        client.loop_start()
 
-    async def _start_mqtt(self) -> None:
-        if self._mqtt_started:
+    def stop(self) -> None:
+        if self._client:
+            self._client.loop_stop()
+            self._client.disconnect()
+            self._client = None
+
+    # ── paho callbacks (run in paho's thread) ────────────────────────────
+
+    def _on_connect(self, client, userdata, flags, rc) -> None:
+        if rc != 0:
+            _LOGGER.error("MQTT connect failed rc=%s", rc)
             return
+        _LOGGER.info("Cradlewise MQTT connected")
+        client.subscribe(SHADOW_GET_ACC, qos=1)
+        client.subscribe(SHADOW_UPD_ACC, qos=1)
+        client.subscribe(SHADOW_UPD_REJ, qos=1)
+        client.subscribe(SHADOW_DELTA,   qos=1)
+        client.publish(SHADOW_GET, json.dumps({}), qos=1)
 
-        creds = self.client.auth.credentials
-        if not creds or not self.cradles:
-            return
-
+    def _on_message(self, client, userdata, msg) -> None:
         try:
-            await self._mqtt.connect(
-                access_key=creds.access_key,
-                secret_key=creds.secret_key,
-                session_token=creds.session_token,
-                cradle_ids=list(self.cradles.keys()),
-                on_state_update=self._on_mqtt_state_update,
-                iot_endpoint=self._app_config.iot_endpoint,
-            )
-            self._mqtt_started = True
-
-            if self._mqtt.available:
-                self.update_interval = timedelta(seconds=MQTT_SCAN_INTERVAL)
-                _LOGGER.info(
-                    "MQTT active — REST poll interval set to %ds", MQTT_SCAN_INTERVAL
-                )
+            data = json.loads(msg.payload)
         except Exception:
-            _LOGGER.debug("MQTT setup failed, continuing with REST polling")
-
-    def _on_mqtt_state_update(self, cradle_id: str, state: dict[str, Any]) -> None:
-        cradle = self.cradles.get(cradle_id)
-        if not cradle:
             return
-        cradle.update_state(state)
-        cradle.online = True
-        self.async_set_updated_data(self.cradles)
 
-    async def _async_update_data(self) -> dict[str, CradlewiseCradle]:
-        if not self.cradles:
-            await self._async_setup()
+        topic = msg.topic
+        if topic == SHADOW_GET_ACC:
+            reported = data.get("state", {}).get("reported", {})
+            self._merge(reported)
 
-        if not self._mqtt_started:
-            await self._start_mqtt()
+        elif topic == SHADOW_DELTA:
+            # Delta carries desired-not-yet-reported keys — don't merge into
+            # state or HA will display pending desired values as actual state.
+            _LOGGER.debug("Shadow delta (ignored for state): %s", data.get("state", {}))
+            self.available = True
+            return
 
-        if self._mqtt_started and not self._mqtt.available:
-            creds = self.client.auth.credentials
-            if creds:
-                await self._mqtt.reconnect(
-                    access_key=creds.access_key,
-                    secret_key=creds.secret_key,
-                    session_token=creds.session_token,
-                    cradle_ids=list(self.cradles.keys()),
-                    on_state_update=self._on_mqtt_state_update,
-                    iot_endpoint=self._app_config.iot_endpoint,
-                )
+        elif topic == SHADOW_UPD_ACC:
+            reported = data.get("state", {}).get("reported", {})
+            if reported:
+                self._merge(reported)
 
-        for cradle in self.cradles.values():
-            try:
-                await self.client.update_cradle(cradle)
-            except CradlewiseApiError as err:
-                _LOGGER.warning("Failed to update %s: %s", cradle.cradle_id, err)
+        elif topic == SHADOW_UPD_REJ:
+            _LOGGER.warning("Shadow update rejected: %s", data)
 
-        for cradle in self.cradles.values():
-            if cradle.baby_id:
-                try:
-                    self.analytics[cradle.baby_id] = (
-                        await self.client.fetch_sleep_analytics(cradle)
-                    )
-                except Exception as err:
-                    _LOGGER.debug("Analytics fetch failed for %s: %s", cradle.baby_id, err)
+        self.available = True
+        self._notify()
 
-        return self.cradles
+    def _on_disconnect(self, client, userdata, rc) -> None:
+        _LOGGER.warning("Cradlewise MQTT disconnected rc=%s — will reconnect", rc)
+        self.available = False
+        self._notify()
 
-    async def async_shutdown(self) -> None:
-        await self._mqtt.disconnect()
-        await super().async_shutdown()
+    # ── State helpers ────────────────────────────────────────────────────
+
+    def _merge(self, reported: dict) -> None:
+        for k, v in reported.items():
+            if isinstance(v, dict) and isinstance(self.state.get(k), dict):
+                self.state[k] = {**self.state[k], **v}
+            else:
+                self.state[k] = v
+
+    def _merge_delta(self, delta: dict) -> None:
+        """Delta only contains changed keys; merge them into state."""
+        self._merge(delta)
+
+    # ── Command API ──────────────────────────────────────────────────────
+
+    def send_desired(self, payload: dict) -> None:
+        """Publish a shadow desired-state update."""
+        if not self._client:
+            _LOGGER.error("MQTT not connected")
+            return
+        msg = json.dumps({"state": {"desired": payload}})
+        _LOGGER.debug("shadow update → %s", msg)
+        self._client.publish(SHADOW_UPDATE, msg, qos=1)
+
+    # ── Convenience state accessors ──────────────────────────────────────
+
+    def get_actuator(self) -> dict:
+        return self.state.get("actuator") or {}
+
+    def get_sound(self) -> dict:
+        return self.state.get("soundSynth") or {}
+
+    def get_light(self) -> dict:
+        return self.state.get("light") or {}

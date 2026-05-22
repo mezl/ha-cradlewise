@@ -6,8 +6,7 @@
         "description": "Enter your Cradlewise account credentials (same email and password you use in the Cradlewise app).\n\n**Initial setup may take several minutes** while configuration is downloaded. Please be patient.",
         "data": {
           "email": "Email",
-          "password": "Password",
-          "local_host": "Crib LAN IP (optional, for live video)"
+          "password": "Password"
         }
       }
     },
@@ -44,9 +43,6 @@
       "last_nap_end": { "name": "Last nap ended" },
       "last_event": { "name": "Last sleep event" }
     },
-    "camera": {
-      "camera": { "name": "Camera" }
-    },
     "binary_sensor": {
       "online": { "name": "Online" },
       "baby_present": { "name": "Baby present" },
@@ -62,6 +58,16 @@
       "rocking_not_effective": { "name": "Rocking not effective" },
       "charging": { "name": "Charging" },
       "power_supply_removed": { "name": "Power connected" }
+    },
+    "switch": {
+      "rocking": { "name": "Rocking" },
+      "music": { "name": "Music" },
+      "night_light": { "name": "Night light" }
+    },
+    "number": {
+      "bounce_amplitude": { "name": "Rock amplitude" },
+      "music_volume": { "name": "Music volume" },
+      "light_intensity": { "name": "Light intensity" }
     }
   }
 }
