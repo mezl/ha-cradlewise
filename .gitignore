@@ -6,3 +6,4 @@ custom_components/cradlewise/certs/client.pem
 custom_components/cradlewise/certs/client.key
 custom_components/cradlewise/certs/amazon_root_ca1.pem
 .env
+custom_components/cradlewise/certs/

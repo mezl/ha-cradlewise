@@ -1,7 +1,11 @@
 DOMAIN = "cradlewise"
 
 CRADLE_ID = "29976d6e-4bbf-433c-bdf6-0ed6606e3fc5"
-HOST = "a2bby18smixe1f-ats.iot.us-east-1.amazonaws.com"
+# Crib's LOCAL MQTT broker (the crib itself, nursery VLAN). The AWS IoT
+# endpoint (a2bby18smixe1f-ats.iot.us-east-1.amazonaws.com) no longer accepts
+# this integration's identity for shadow subscriptions since the 2026-10-03
+# policy change — see coordinator.py CLIENT_ID note.
+HOST = "192.168.14.231"
 PORT = 8883
 
 SHADOW_GET     = f"$aws/things/{CRADLE_ID}/shadow/get"

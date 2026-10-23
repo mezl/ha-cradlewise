@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from homeassistant.components.sensor import SensorEntity, SensorStateClass, SensorDeviceClass
+from homeassistant.const import UnitOfTemperature, UnitOfTime
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -26,6 +26,13 @@ async def async_setup_entry(
 ) -> None:
     coord: CradlewiseCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities([
+        NapCountToday(coord),
+        TotalSleepToday(coord),
+        LongestNapToday(coord),
+        LastNapStart(coord),
+        LastNapEnd(coord),
+        SoothingCountToday(coord),
+        TotalAwakeToday(coord),
         SleepState(coord),
         SleepPhase(coord),
         CradleMode(coord),
@@ -38,22 +45,9 @@ async def async_setup_entry(
         MusicMode(coord),
         LightIntensitySensor(coord),
         MusicTrack(coord),
-        # Environment sensors
-        Temperature(coord),
-        Humidity(coord),
-        NoiseLevel(coord),
-        BatteryLife(coord),
-        # Analytics sensors (populated when crib reports dayStats via MQTT)
-        TotalSleepToday(coord),
-        TotalAwakeToday(coord),
-        NapCount(coord),
-        LongestNap(coord),
-        SootheCount(coord),
-        SleepTime(coord),
-        WakeUpTime(coord),
-        LastNapStarted(coord),
-        LastNapEnded(coord),
-        LastSleepEvent(coord),
+        RoomTemperature(coord),
+        FirmwareVersion(coord),
+        FirmwareUpdateVersion(coord),
     ])
 
 
@@ -213,197 +207,138 @@ class MusicTrack(_Base):
         return self._coord.get_sound().get("trackName")
 
 
-# ── Environment sensors ──────────────────────────────────────────────────
-
-class Temperature(_Base):
-    _attr_name = "Temperature"
-    _attr_unique_id = f"{CRADLE_ID}_temperature"
-    _attr_icon = "mdi:thermometer"
+class RoomTemperature(_Base):
+    _attr_name = "Room Temperature"
+    _attr_unique_id = f"{CRADLE_ID}_room_temperature"
     _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-    _attr_state_class = SensorStateClass.MEASUREMENT
 
     @property
-    def native_value(self):
-        v = self._coord.state.get("temperature")
-        if v is None:
-            sensor_data = self._coord.state.get("sensorData") or self._coord.state.get("ambientSensor") or {}
-            v = sensor_data.get("temperature")
-        return float(v) if v is not None else None
+    def native_value(self) -> float | None:
+        raw = self._coord.get_device_status().get("ambientTemp")
+        if raw is None:
+            return None
+        return round(raw / 1000, 1)
 
 
-class Humidity(_Base):
-    _attr_name = "Humidity"
-    _attr_unique_id = f"{CRADLE_ID}_humidity"
-    _attr_icon = "mdi:water-percent"
-    _attr_device_class = SensorDeviceClass.HUMIDITY
-    _attr_native_unit_of_measurement = PERCENTAGE
-    _attr_state_class = SensorStateClass.MEASUREMENT
+class FirmwareVersion(_Base):
+    _attr_name = "Firmware Version"
+    _attr_unique_id = f"{CRADLE_ID}_firmware_version"
+    _attr_icon = "mdi:chip"
 
     @property
-    def native_value(self):
-        v = self._coord.state.get("humidity")
-        if v is None:
-            sensor_data = self._coord.state.get("sensorData") or self._coord.state.get("ambientSensor") or {}
-            v = sensor_data.get("humidity")
-        return float(v) if v is not None else None
+    def native_value(self) -> str | None:
+        return self._coord.get_meta().get("software_version")
 
 
-class NoiseLevel(_Base):
-    _attr_name = "Noise Level"
-    _attr_unique_id = f"{CRADLE_ID}_noise_level"
-    _attr_icon = "mdi:volume-medium"
-    _attr_state_class = SensorStateClass.MEASUREMENT
+class FirmwareUpdateVersion(_Base):
+    _attr_name = "Firmware Update Version"
+    _attr_unique_id = f"{CRADLE_ID}_firmware_update_version"
+    _attr_icon = "mdi:update"
 
     @property
-    def native_value(self):
-        v = self._coord.state.get("noiseLevel") or self._coord.state.get("noise_level")
-        if v is None:
-            sensor_data = self._coord.state.get("sensorData") or {}
-            v = sensor_data.get("noiseLevel")
-        return float(v) if v is not None else None
+    def native_value(self) -> str | None:
+        upd = self._coord.get_update()
+        if not upd.get("available"):
+            return None
+        return upd.get("version")
 
 
-class BatteryLife(_Base):
-    _attr_name = "Battery Life"
-    _attr_unique_id = f"{CRADLE_ID}_battery_life"
-    _attr_device_class = SensorDeviceClass.BATTERY
-    _attr_native_unit_of_measurement = PERCENTAGE
-    _attr_state_class = SensorStateClass.MEASUREMENT
+# ── Local sleep analytics (derived from MQTT state transitions) ───────────────
+
+class _SleepAnalyticsBase(_Base):
+    """Base for analytics sensors — reads from the coordinator's SleepTracker."""
+
+
+class NapCountToday(_SleepAnalyticsBase):
+    _attr_name = "Nap Count Today"
+    _attr_unique_id = f"{CRADLE_ID}_nap_count_today"
+    _attr_icon = "mdi:sleep"
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
 
     @property
-    def native_value(self):
-        v = (self._coord.state.get("deviceStatus") or {}).get("batteryLife")
-        return int(v) if v is not None else None
+    def native_value(self) -> int:
+        return self._coord.sleep_tracker.nap_count
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Today's raw sleep/soothe timeline.
+
+        The Sleep Insights card draws its day chart from these instead of
+        recorder history, so the chart still works when recorder is down.
+        """
+        tracker = self._coord.sleep_tracker
+        return {
+            "naps": tracker.sessions,
+            "awake_periods": tracker.awake_sessions,
+            "soothing_events": tracker.soothing_events,
+        }
 
 
-# ── Analytics sensors (populated via dayStats shadow key or direct shadow keys) ──
-
-class TotalSleepToday(_Base):
+class TotalSleepToday(_SleepAnalyticsBase):
     _attr_name = "Total Sleep Today"
     _attr_unique_id = f"{CRADLE_ID}_total_sleep_today"
+    _attr_icon = "mdi:clock-time-eight"
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+
+    @property
+    def native_value(self) -> float:
+        return self._coord.sleep_tracker.total_sleep_minutes
+
+
+class LongestNapToday(_SleepAnalyticsBase):
+    _attr_name = "Longest Nap Today"
+    _attr_unique_id = f"{CRADLE_ID}_longest_nap_today"
+    _attr_icon = "mdi:timer-outline"
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+
+    @property
+    def native_value(self) -> float | None:
+        return self._coord.sleep_tracker.longest_nap_minutes
+
+
+class LastNapStart(_SleepAnalyticsBase):
+    _attr_name = "Last Nap Start"
+    _attr_unique_id = f"{CRADLE_ID}_last_nap_start"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
     _attr_icon = "mdi:sleep"
-    _attr_native_unit_of_measurement = "min"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_translation_key = "total_sleep_today"
 
     @property
     def native_value(self):
-        day = self._coord.state.get("dayStats") or {}
-        v = day.get("totalSleepDuration") or day.get("totalSleep")
-        return int(v) if v is not None else None
+        return self._coord.sleep_tracker.last_nap_start
 
 
-class TotalAwakeToday(_Base):
+class LastNapEnd(_SleepAnalyticsBase):
+    _attr_name = "Last Nap End"
+    _attr_unique_id = f"{CRADLE_ID}_last_nap_end"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:sleep-off"
+
+    @property
+    def native_value(self):
+        return self._coord.sleep_tracker.last_nap_end
+
+
+class SoothingCountToday(_SleepAnalyticsBase):
+    _attr_name = "Soothing Count Today"
+    _attr_unique_id = f"{CRADLE_ID}_soothing_count_today"
+    _attr_icon = "mdi:baby-carriage"
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    @property
+    def native_value(self) -> int:
+        return self._coord.sleep_tracker.soothing_count
+
+
+class TotalAwakeToday(_SleepAnalyticsBase):
     _attr_name = "Total Awake Today"
     _attr_unique_id = f"{CRADLE_ID}_total_awake_today"
     _attr_icon = "mdi:weather-sunny"
-    _attr_native_unit_of_measurement = "min"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_translation_key = "total_awake_today"
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
 
     @property
-    def native_value(self):
-        day = self._coord.state.get("dayStats") or {}
-        v = day.get("totalAwakeDuration") or day.get("totalAwake")
-        return int(v) if v is not None else None
-
-
-class NapCount(_Base):
-    _attr_name = "Nap Count"
-    _attr_unique_id = f"{CRADLE_ID}_nap_count"
-    _attr_icon = "mdi:counter"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_translation_key = "nap_count"
-
-    @property
-    def native_value(self):
-        day = self._coord.state.get("dayStats") or {}
-        v = day.get("napCount")
-        return int(v) if v is not None else None
-
-
-class LongestNap(_Base):
-    _attr_name = "Longest Nap"
-    _attr_unique_id = f"{CRADLE_ID}_longest_nap"
-    _attr_icon = "mdi:trophy"
-    _attr_native_unit_of_measurement = "min"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_translation_key = "longest_nap"
-
-    @property
-    def native_value(self):
-        day = self._coord.state.get("dayStats") or {}
-        v = day.get("longestNapDuration") or day.get("longestNap")
-        return int(v) if v is not None else None
-
-
-class SootheCount(_Base):
-    _attr_name = "Soothe Count"
-    _attr_unique_id = f"{CRADLE_ID}_soothe_count"
-    _attr_icon = "mdi:hand-heart"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_translation_key = "soothe_count"
-
-    @property
-    def native_value(self):
-        day = self._coord.state.get("dayStats") or {}
-        v = day.get("sootheCount")
-        return int(v) if v is not None else None
-
-
-class SleepTime(_Base):
-    _attr_name = "Sleep Time"
-    _attr_unique_id = f"{CRADLE_ID}_sleep_time"
-    _attr_icon = "mdi:clock-outline"
-    _attr_translation_key = "sleep_time"
-
-    @property
-    def native_value(self) -> str | None:
-        return self._coord.state.get("sleepTime") or self._coord.state.get("lastSleepTime")
-
-
-class WakeUpTime(_Base):
-    _attr_name = "Wake-up Time"
-    _attr_unique_id = f"{CRADLE_ID}_wake_up_time"
-    _attr_icon = "mdi:alarm"
-    _attr_translation_key = "wake_up_time"
-
-    @property
-    def native_value(self) -> str | None:
-        return self._coord.state.get("wakeUpTime") or self._coord.state.get("lastWakeUpTime")
-
-
-class LastNapStarted(_Base):
-    _attr_name = "Last Nap Started"
-    _attr_unique_id = f"{CRADLE_ID}_last_nap_start"
-    _attr_icon = "mdi:clock-start"
-    _attr_translation_key = "last_nap_start"
-
-    @property
-    def native_value(self) -> str | None:
-        day = self._coord.state.get("dayStats") or {}
-        return day.get("lastNapStart") or self._coord.state.get("lastNapStart")
-
-
-class LastNapEnded(_Base):
-    _attr_name = "Last Nap Ended"
-    _attr_unique_id = f"{CRADLE_ID}_last_nap_end"
-    _attr_icon = "mdi:clock-end"
-    _attr_translation_key = "last_nap_end"
-
-    @property
-    def native_value(self) -> str | None:
-        day = self._coord.state.get("dayStats") or {}
-        return day.get("lastNapEnd") or self._coord.state.get("lastNapEnd")
-
-
-class LastSleepEvent(_Base):
-    _attr_name = "Last Sleep Event"
-    _attr_unique_id = f"{CRADLE_ID}_last_event"
-    _attr_icon = "mdi:history"
-    _attr_translation_key = "last_event"
-
-    @property
-    def native_value(self) -> str | None:
-        return self._coord.state.get("lastEvent") or self._coord.state.get("lastSleepEvent")
+    def native_value(self) -> float:
+        return self._coord.sleep_tracker.total_awake_minutes

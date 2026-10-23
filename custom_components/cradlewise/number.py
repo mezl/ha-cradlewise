@@ -29,6 +29,7 @@ async def async_setup_entry(
         MusicVolume(coord),
         LightIntensity(coord),
         ResponsivitySetting(coord),
+        BounceDuration(coord),
     ])
 
 
@@ -131,3 +132,21 @@ class ResponsivitySetting(_Base):
 
     def set_native_value(self, value: float) -> None:
         self._coord.send_desired({"responsivitySetting": int(value)})
+
+
+class BounceDuration(_Base):
+    _attr_name = "Bounce Duration"
+    _attr_unique_id = f"{CRADLE_ID}_bounce_duration"
+    _attr_icon = "mdi:timer"
+    _attr_native_min_value = 1
+    _attr_native_max_value = 60
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = "min"
+
+    @property
+    def native_value(self) -> float | None:
+        v = self._coord.get_actuator().get("duration")
+        return float(v) if v is not None else None
+
+    def set_native_value(self, value: float) -> None:
+        self._coord.send_desired({"actuator": {"duration": int(value)}})

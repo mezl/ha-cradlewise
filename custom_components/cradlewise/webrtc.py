@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import fractions
 import json
 import logging
 import re
@@ -11,14 +12,16 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import av
+import numpy as np
 import paho.mqtt.client as mqtt
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import AudioStreamTrack, RTCPeerConnection, RTCSessionDescription
 from aiortc.sdp import candidate_from_sdp
 
 _LOGGER = logging.getLogger(__name__)
 
 CERTS_DIR = Path(__file__).parent / "certs"
-_HOST = "192.168.14.233"
+_HOST = "192.168.14.231"
 _PORT = 8883
 _CRADLE_ID = "29976d6e-4bbf-433c-bdf6-0ed6606e3fc5"
 _ROOM_TOPIC = f"/{_CRADLE_ID}/room"
@@ -106,13 +109,50 @@ def _make_ssl_ctx() -> ssl.SSLContext:
     return ctx
 
 
-class CradlewiseVideoReceiver:
-    """Receives H264 video from the crib via WebRTC-over-MQTT."""
+class CribTalkTrack(AudioStreamTrack):
+    """Outbound audio track — sends s16le 48 kHz stereo PCM to the crib."""
 
-    def __init__(self, frame_callback: Callable) -> None:
+    kind = "audio"
+    _RATE = 48000
+    _SAMPLES = 960           # 20 ms per frame
+    _FRAME_BYTES = _SAMPLES * 2 * 2  # stereo × s16
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+
+    async def recv(self) -> av.AudioFrame:
+        pts, time_base = await self.next_timestamp()
+        try:
+            data = self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            data = bytes(self._FRAME_BYTES)  # silence
+        data = (data + bytes(self._FRAME_BYTES))[: self._FRAME_BYTES]
+        arr = np.frombuffer(data, dtype=np.int16).reshape(1, self._SAMPLES * 2)
+        frame = av.AudioFrame.from_ndarray(arr, format="s16", layout="stereo")
+        frame.sample_rate = self._RATE
+        frame.pts = pts
+        frame.time_base = time_base
+        return frame
+
+    def push_pcm(self, pcm: bytes) -> None:
+        """Chunk raw s16le stereo PCM into 20 ms frames and enqueue."""
+        for i in range(0, len(pcm), self._FRAME_BYTES):
+            try:
+                self._queue.put_nowait(pcm[i : i + self._FRAME_BYTES])
+            except asyncio.QueueFull:
+                pass  # slow consumer — drop
+
+
+class CradlewiseVideoReceiver:
+    """Receives H264 video (and audio if offered) from the crib via WebRTC-over-MQTT."""
+
+    def __init__(self, frame_callback: Callable, audio_callback: Callable | None = None) -> None:
         self._frame_callback = frame_callback
+        self._audio_callback = audio_callback
         self._client: mqtt.Client | None = None
         self._pc: RTCPeerConnection | None = None
+        self._talk_track: CribTalkTrack | None = None
         self._session_id: str = ""
         self._loop: asyncio.AbstractEventLoop | None = None
         self._running = False
@@ -131,6 +171,12 @@ class CradlewiseVideoReceiver:
         if self._pc and self._loop:
             asyncio.run_coroutine_threadsafe(self._pc.close(), self._loop)
             self._pc = None
+        self._talk_track = None
+
+    def push_audio(self, pcm: bytes) -> None:
+        """Push raw s16le stereo 48 kHz PCM to send to the crib."""
+        if self._talk_track is not None:
+            self._talk_track.push_pcm(pcm)
 
     # ── MQTT ────────────────────────────────────────────────────────────────
 
@@ -142,7 +188,12 @@ class CradlewiseVideoReceiver:
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect
         self._client = client
-        client.connect_async(_HOST, _PORT, keepalive=15)
+        # keepalive raised 15s -> 60s: the crib's WiFi is jittery (in-room AP, 0% loss
+        # but latency spikes), and a 15s keepalive tore down the whole WebRTC session
+        # after only ~22s of silence, turning brief blips into ~2.5min recovery stalls.
+        # 60s lets the session ride out short blips; genuine stalls are still caught by
+        # the frigate-fps `crib_stall_auto_recover` automation.
+        client.connect_async(_HOST, _PORT, keepalive=60)
         client.loop_start()
 
     def _publish(self, payload: dict) -> None:
@@ -194,6 +245,7 @@ class CradlewiseVideoReceiver:
         if self._pc:
             await self._pc.close()
             self._pc = None
+        self._talk_track = None
 
     async def _schedule_reconnect(self) -> None:
         """Wait, then re-request a stream offer from AMS."""
@@ -215,10 +267,17 @@ class CradlewiseVideoReceiver:
             pc = RTCPeerConnection()
             self._pc = pc
 
+            # Add outbound audio track before negotiation so it appears in the answer SDP.
+            self._talk_track = CribTalkTrack()
+            pc.addTrack(self._talk_track)
+
             @pc.on("track")
             def on_track(track):
+                _LOGGER.info("Received %s track from crib", track.kind)
                 if track.kind == "video":
                     asyncio.ensure_future(self._receive_video(track))
+                elif track.kind == "audio" and self._audio_callback:
+                    asyncio.ensure_future(self._receive_audio(track))
 
             @pc.on("connectionstatechange")
             async def on_state():
@@ -319,6 +378,24 @@ class CradlewiseVideoReceiver:
                 self._frame_callback(frame)
             except Exception as e:
                 _LOGGER.debug("Video stream ended: %s", e)
+                break
+
+    async def _receive_audio(self, track) -> None:
+        _LOGGER.info("Audio stream started (format will be logged on first frame)")
+        first = True
+        while True:
+            try:
+                frame = await track.recv()
+                if first:
+                    _LOGGER.info(
+                        "Audio frame: format=%s rate=%s channels=%s samples=%s",
+                        frame.format.name, frame.sample_rate,
+                        len(frame.layout.channels), frame.samples,
+                    )
+                    first = False
+                self._audio_callback(frame)
+            except Exception as e:
+                _LOGGER.debug("Audio stream ended: %s", e)
                 break
 
     async def _keepalive_loop(self) -> None:

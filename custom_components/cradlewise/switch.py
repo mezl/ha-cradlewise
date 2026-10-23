@@ -32,6 +32,8 @@ async def async_setup_entry(
         AutoVolumeSwitch(coord),
         AutoMoodSwitch(coord),
         KeepMusicOnDuringSleepSwitch(coord),
+        AdaptiveSoothingSwitch(coord),
+        KeepBounceOnDuringSleepSwitch(coord),
     ])
 
 
@@ -174,3 +176,35 @@ class KeepMusicOnDuringSleepSwitch(_Base):
 
     def turn_off(self, **kwargs) -> None:
         self._coord.send_desired({"keepMusicOnDuringSleep": False})
+
+
+class AdaptiveSoothingSwitch(_Base):
+    _attr_name = "Adaptive Soothing"
+    _attr_unique_id = f"{CRADLE_ID}_adaptive_soothing"
+    _attr_icon = "mdi:brain"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.get_control().get("adaptiveSoothingEnabled"))
+
+    def turn_on(self, **kwargs) -> None:
+        self._coord.send_desired({"control": {"adaptiveSoothingEnabled": True}})
+
+    def turn_off(self, **kwargs) -> None:
+        self._coord.send_desired({"control": {"adaptiveSoothingEnabled": False}})
+
+
+class KeepBounceOnDuringSleepSwitch(_Base):
+    _attr_name = "Keep Bounce During Sleep"
+    _attr_unique_id = f"{CRADLE_ID}_keep_bounce_during_sleep"
+    _attr_icon = "mdi:baby-carriage"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.state.get("keepBounceOnDuringSleep"))
+
+    def turn_on(self, **kwargs) -> None:
+        self._coord.send_desired({"keepBounceOnDuringSleep": True})
+
+    def turn_off(self, **kwargs) -> None:
+        self._coord.send_desired({"keepBounceOnDuringSleep": False})

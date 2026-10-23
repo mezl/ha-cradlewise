@@ -10,6 +10,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN, CRADLE_ID
 from .coordinator import CradlewiseCoordinator
 
+_EVENT_CRY = "cradlewise_baby_crying"
+
 _DEVICE_INFO = DeviceInfo(
     identifiers={(DOMAIN, CRADLE_ID)},
     manufacturer="Cradlewise",
@@ -37,6 +39,8 @@ async def async_setup_entry(
         InSleepSchedule(coord),
         InSoothingWindow(coord),
         RockingNotEffective(coord),
+        FirmwareUpdateAvailable(coord),
+        BabyCrying(hass),
     ])
 
 
@@ -44,6 +48,7 @@ class _Base(BinarySensorEntity):
     _attr_should_poll = False
 
     def __init__(self, coord: CradlewiseCoordinator) -> None:
+        super().__init__()
         self._coord = coord
         self._unsub = None
 
@@ -187,3 +192,71 @@ class RockingNotEffective(_Base):
     @property
     def is_on(self) -> bool:
         return bool(self._coord.state.get("rockingNotEffective"))
+
+
+class FirmwareUpdateAvailable(_Base):
+    _attr_name = "Firmware Update Available"
+    _attr_unique_id = f"{CRADLE_ID}_firmware_update_available"
+    _attr_device_class = BinarySensorDeviceClass.UPDATE
+    _attr_icon = "mdi:update"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._coord.get_update().get("available"))
+
+
+class BabyCrying(BinarySensorEntity):
+    """Detected infant crying from the crib audio stream."""
+
+    _attr_name = "Baby Crying"
+    _attr_unique_id = f"{CRADLE_ID}_baby_crying"
+    _attr_device_class = BinarySensorDeviceClass.SOUND
+    _attr_icon = "mdi:emoticon-cry-outline"
+    _attr_should_poll = False
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        super().__init__()
+        self._hass = hass
+        self._is_crying = False
+        self._unsub_event = None
+        self._unsub_camera = None
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, CRADLE_ID)},
+            manufacturer="Cradlewise",
+            model="Smart Crib",
+            name="Cradlewise avo",
+        )
+
+    @property
+    def is_on(self) -> bool:
+        return self._is_crying
+
+    async def async_added_to_hass(self) -> None:
+        # Primary: direct callback from camera entity (low latency, no event bus overhead)
+        cam = self._hass.data.get(DOMAIN, {}).get("camera")
+        if cam is not None:
+            self._unsub_camera = cam.add_cry_listener(self._on_cry_update)
+        else:
+            # Fallback: HA event bus (e.g., camera loaded before binary_sensor finishes)
+            self._unsub_event = self._hass.bus.async_listen(
+                _EVENT_CRY, self._on_cry_event
+            )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_camera:
+            self._unsub_camera()
+        if self._unsub_event:
+            self._unsub_event()
+
+    @callback
+    def _on_cry_update(self, is_crying: bool) -> None:
+        self._is_crying = is_crying
+        self.async_write_ha_state()
+
+    @callback
+    def _on_cry_event(self, event) -> None:
+        self._is_crying = bool(event.data.get("is_crying", False))
+        self.async_write_ha_state()

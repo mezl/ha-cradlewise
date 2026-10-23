@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import paho.mqtt.client as mqtt
 
+from .sleep_analytics import SleepTracker
 from .const import (
     CRADLE_ID, HOST, PORT,
     SHADOW_GET, SHADOW_GET_ACC,
@@ -19,6 +20,14 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 CERTS_DIR = Path(__file__).parent / "certs"
+
+# Research-device identity (row 19c3aef9, cert serial 705C…). Since the
+# 2026-10-03 AWS IoT policy change, connect requires clientId == thing name
+# AND the AWS policy denies this identity's subscriptions to the crib shadow
+# topics (instant TCP drop on SUBSCRIBE) — so we talk to the crib's LOCAL
+# broker instead (proven: CONNACK 0, full 20KB shadow, coexists with the
+# phone app's own local connection, clientId differs so no kick conflicts).
+CLIENT_ID = "19c3aef9-36bf-48e6-969c-e199accbeee6"
 
 
 class CradlewiseCoordinator:
@@ -31,6 +40,8 @@ class CradlewiseCoordinator:
         self._listeners: list[Callable] = []
         self._client: mqtt.Client | None = None
         self._stop_event = threading.Event()
+        storage_path = Path(hass.config.path(".storage")) / "cradlewise_sleep_events.json"
+        self.sleep_tracker = SleepTracker(storage_path)
 
     # ── Listener management ──────────────────────────────────────────────
 
@@ -48,26 +59,38 @@ class CradlewiseCoordinator:
     # ── Connection ───────────────────────────────────────────────────────
 
     def start(self) -> None:
-        ctx = ssl.create_default_context(
-            ssl.Purpose.SERVER_AUTH,
-            cafile=str(CERTS_DIR / "amazon_root_ca1.pem"),
-        )
-        ctx.load_cert_chain(
-            certfile=str(CERTS_DIR / "client.pem"),
-            keyfile=str(CERTS_DIR / "client.key"),
-        )
+        # OpenSSL 3.5+ (HA 2026.7 ships 3.5.7) rejects the crib broker's group
+        # CA cert: "CA cert does not include key usage extension" — older
+        # OpenSSL accepted it. We can't re-sign Cradlewise's CA, so we don't
+        # verify the SERVER cert (verify_mode NONE). The connection is still
+        # authenticated: the broker itself requires our mTLS client cert below,
+        # and it's a fixed LAN device (192.168.14.231).
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.load_cert_chain(
+            certfile=str(CERTS_DIR / "mqtt_client.pem"),
+            keyfile=str(CERTS_DIR / "mqtt_client.key"),
+        )
 
-        client = mqtt.Client(client_id="cradlewise-ha")
+        client = mqtt.Client(client_id=CLIENT_ID)
         client.tls_set_context(ctx)
         client.on_connect    = self._on_connect
         client.on_message    = self._on_message
         client.on_disconnect = self._on_disconnect
+        client.on_connect_fail = self._on_connect_fail
+        # Route paho's internal (socket/TLS) logging into our logger so
+        # connect failures inside the loop thread aren't swallowed.
+        client.enable_logger(_LOGGER)
 
         self._client = client
         _LOGGER.debug("Connecting to %s:%s", HOST, PORT)
         client.connect_async(HOST, PORT, keepalive=30)
         client.loop_start()
+
+    @staticmethod
+    def _on_connect_fail(client, userdata=None) -> None:
+        _LOGGER.warning("MQTT connect ATTEMPT FAILED (on_connect_fail) — will retry")
 
     def stop(self) -> None:
         if self._client:
@@ -115,6 +138,7 @@ class CradlewiseCoordinator:
             _LOGGER.warning("Shadow update rejected: %s", data)
 
         self.available = True
+        self.sleep_tracker.on_state_update(self.state)
         self._notify()
 
     def _on_disconnect(self, client, userdata, rc) -> None:
@@ -156,3 +180,15 @@ class CradlewiseCoordinator:
 
     def get_light(self) -> dict:
         return self.state.get("light") or {}
+
+    def get_control(self) -> dict:
+        return self.state.get("control") or {}
+
+    def get_device_status(self) -> dict:
+        return self.state.get("deviceStatus") or {}
+
+    def get_meta(self) -> dict:
+        return self.state.get("meta") or {}
+
+    def get_update(self) -> dict:
+        return self.state.get("update") or {}
