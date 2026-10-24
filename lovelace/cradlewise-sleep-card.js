@@ -1,5 +1,5 @@
 /**
- * Cradlewise Sleep Insights Card v9 — fully interactive + month picker
+ * Cradlewise Sleep Insights Card v19 — Month tab (real 30-day data), sleep-day (8am–8am) keying
  * Main: Day/Week/Month tabs (all functional)
  * Preview: week navigation ◀▶, C-shape tap-to-tooltip, List nap expand
  */
@@ -13,73 +13,11 @@ const C = {
   trackBg:'rgba(37,20,98,0.10)',
 };
 
-// Generate deterministic demo history for a given Date
-function makeDayDemo(date) {
-  const day = new Date(date); day.setHours(0,0,0,0);
-  const t = (h,m=0) => new Date(day.getTime()+(h*60+m)*60000).toISOString();
-  const dow = day.getDay(); // 0=Sun...6=Sat
-  // Different nap schedules for variety
-  const schedules = [
-    // weekday standard
-    [[8,15],[9,30],[11,0],[12,30],[14,15],[17,0]],
-    // 2-nap day
-    [[9,0],[10,45],[13,30],[16,0],[],[],],
-    // long morning nap
-    [[8,30],[11,15],[14,0],[15,30],[],[],],
-  ];
-  const sched = schedules[dow % schedules.length];
-  const [n1s,n1e,n2s,n2e,n3s,n3e] = sched.map(x=>x.length?x:null);
-
-  const phase = [
-    {entity_id:'sensor.cradlewise_avo_sleep_phase',state:'away',last_changed:t(0)},
-    {entity_id:'sensor.cradlewise_avo_sleep_phase',state:'awake',last_changed:t(8,0)},
-  ];
-  let totalSleep=0, napCount=0, longest=0;
-
-  const addNap=(ns,ne,stir)=>{
-    if(!ns) return;
-    const [nh,nm]=ns, [eh,em]=ne;
-    const dur=(eh*60+em)-(nh*60+nm);
-    totalSleep+=dur; napCount++; if(dur>longest) longest=dur;
-    phase.push({entity_id:'sensor.cradlewise_avo_sleep_phase',state:'sleep',last_changed:t(nh,nm)});
-    phase.push({entity_id:'sensor.cradlewise_avo_sleep_phase',state:'stirring',last_changed:t(nh,nm+Math.round(dur*0.6))});
-    phase.push({entity_id:'sensor.cradlewise_avo_sleep_phase',state:'sleep',last_changed:t(nh,nm+Math.round(dur*0.75))});
-    phase.push({entity_id:'sensor.cradlewise_avo_sleep_phase',state:'awake',last_changed:t(eh,em)});
-  };
-  addNap(n1s,n1e); addNap(n2s,n2e); addNap(n3s,n3e);
-  phase.push({entity_id:'sensor.cradlewise_avo_sleep_phase',state:'away',last_changed:t(17,30)});
-
-  const soothing=[];
-  const addSoothe=(ns,stir)=>{
-    if(!ns) return;
-    const [nh,nm]=ns, dur=stir||35;
-    soothing.push({entity_id:'binary_sensor.cradlewise_avo_crib_soothing',state:'on',last_changed:t(nh,nm+Math.round(dur*0.6)+1)});
-    soothing.push({entity_id:'binary_sensor.cradlewise_avo_crib_soothing',state:'off',last_changed:t(nh,nm+Math.round(dur*0.6)+4)});
-  };
-  addSoothe(n1s); addSoothe(n2s); addSoothe(n3s);
-
-  const awakeMin=Math.round(8*60-(totalSleep)); // rough
-  return {phase, soothing, stats:{
-    total_sleep:String(totalSleep), total_awake:String(Math.max(0,awakeMin)),
-    soothe_count:String(napCount), nap_count:String(napCount), longest_nap:String(longest),
-  }};
-}
-
-// 7-day weekly totals (deterministic per week-start date)
-function makeWeekData(weekStartDate) {
-  const BASE=[480,510,420,495,540,504,330];
-  return Array.from({length:7},(_,i)=>{
-    const d=new Date(weekStartDate); d.setDate(d.getDate()+i);
-    const seed=d.getDate()+d.getMonth()*31;
-    return Math.round(BASE[i]*(0.85+((seed*17)%30)/100));
-  });
-}
-
 class CradlewiseSleepCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({mode:'open'});
-    this._hass=null; this._config=null; this._history=null;
+    this._hass=null; this._config=null; this._history=null; this._historyErr=null;
     this._lastFetch=0; this._FETCH_INTERVAL=300_000;
     // Main view state
     this._mainTab='day';  // 'day'|'week'|'month'
@@ -87,6 +25,7 @@ class CradlewiseSleepCard extends HTMLElement {
     this._demo=false;
     this._chartTab='chart'; // 'chart'|'list'
     this._weekOffset=0;    // 0=current week, -1=prev week, etc.
+    this._monthOffset=0;   // 0=current month, -1=prev month (month tab)
     this._selectedDayIdx=6; // within the current week strip
     this._expandedNapIdx=null;
     this._cTooltip=null;   // {t, timeStr, stateLabel, col} or null
@@ -99,13 +38,231 @@ class CradlewiseSleepCard extends HTMLElement {
   setConfig(cfg) {
     this._config={
       name:cfg.name||'Avo',
-      sleep_phase:cfg.sleep_phase||'sensor.cradlewise_avo_sleep_phase',
-      total_sleep:cfg.total_sleep||'sensor.cradlewise_avo_total_sleep_today',
-      total_awake:cfg.total_awake||'sensor.cradlewise_avo_total_awake_today',
-      soothe_count:cfg.soothe_count||'sensor.cradlewise_avo_soothe_count',
-      nap_count:cfg.nap_count||'sensor.cradlewise_avo_nap_count',
-      longest_nap:cfg.longest_nap||'sensor.cradlewise_avo_longest_nap',
-      crib_soothing:cfg.crib_soothing||'binary_sensor.cradlewise_avo_crib_soothing',
+      // sensor.cradlewise_avo_sleep_phase reads the babySleepPhase shadow key,
+      // which this crib pins at 0 ("away") forever. babySleepState — exposed as
+      // the sleep_state sensor — is the one that actually moves, so prefer it and
+      // keep sleep_phase as a fallback for builds that only ship that.
+      sleep_phase:cfg.sleep_phase||['sensor.cradlewise_avo_sleep_state','sensor.cradlewise_avo_sleep_phase'],
+      total_sleep:cfg.total_sleep||['sensor.cradlewise_avo_total_sleep_today'],
+      total_awake:cfg.total_awake||['sensor.cradlewise_avo_total_awake_today'],
+      soothe_count:cfg.soothe_count||['sensor.cradlewise_avo_soothing_count_today','sensor.cradlewise_avo_soothe_count'],
+      nap_count:cfg.nap_count||['sensor.cradlewise_avo_nap_count_today','sensor.cradlewise_avo_nap_count'],
+      longest_nap:cfg.longest_nap||['sensor.cradlewise_avo_longest_nap_today','sensor.cradlewise_avo_longest_nap'],
+      crib_soothing:cfg.crib_soothing||['binary_sensor.cradlewise_avo_crib_soothing'],
+    };
+  }
+
+  // Entity ids may be a single id (from user config) or a list of candidates.
+  // Older integration builds name these sensors without the "_today" suffix,
+  // and a renamed sensor is left behind in the registry as a permanently
+  // unavailable entity — so pick the first candidate that actually has a
+  // usable state, not merely the first that exists.
+  _pick(cand){
+    const list=Array.isArray(cand)?cand:[cand];
+    for(const id of list){ if(this._live(id)) return id; }
+    return list[0];
+  }
+  _live(id){
+    const e=this._hass?.states[id];
+    return !!e && e.state!=='unavailable' && e.state!=='unknown';
+  }
+
+  // ── Per-day history ───────────────────────────────────────────────────────
+
+  _dayKey(d){return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;}
+
+  // Fetch one calendar day of phase/soothe history. Results are cached per day;
+  // today's entry is short-lived so it keeps up with the live crib.
+  _fetchDay(date){
+    const key=this._dayKey(date);
+    this._dayCache=this._dayCache||{};
+    const hit=this._dayCache[key];
+    const isToday=this._dayKey(new Date())===key;
+    if(hit&&(hit.loading||!isToday||Date.now()-hit.at<this._FETCH_INTERVAL)) return hit;
+
+    const entry=this._dayCache[key]={loading:true,at:Date.now(),phase:[],soothing:[]};
+    const dayStart=new Date(date); dayStart.setHours(0,0,0,0);
+    const dayEnd=new Date(dayStart); dayEnd.setDate(dayEnd.getDate()+1);
+    const c=this._config;
+    // end_time is NOT optional: the history API defaults to start+1day, so a
+    // multi-day range silently returns only its first day.
+    // The daily-total sensors reset at midnight and only climb, so their peak
+    // within a day IS that day's total — and it is what the tiles showed at the
+    // time. Far better than re-deriving totals from sleep_state, which only
+    // covers whatever part of the day the recorder happened to be up for.
+    const totalIds=[c.total_sleep,c.total_awake,c.nap_count,c.longest_nap,c.soothe_count]
+      .map(x=>this._pick(x));
+    const period=(ids)=>`history/period/${dayStart.toISOString()}`
+      +`?filter_entity_id=${ids}`
+      +`&end_time=${encodeURIComponent(dayEnd.toISOString())}`
+      +`&minimal_response=true&no_attributes=true`;
+    const url=period(`${this._pick(c.sleep_phase)},${this._pick(c.crib_soothing)}`);
+    Promise.all([
+      this._hass.callApi('GET',url),
+      isToday?Promise.resolve(null):this._hass.callApi('GET',period(totalIds.join(','))),
+    ]).then(([res,totalsRes])=>{
+      const ph=res?.[0]||[],so=res?.[1]||[];
+      entry.phase=ph.filter(e=>e.state&&e.state!=='unavailable');
+      entry.soothing=so;
+      if(totalsRes) entry.totals=this._peakTotals(totalsRes,totalIds);
+      entry.loading=false; entry.at=Date.now();
+      if(isToday) this._backfillToday(entry,dayStart);
+      this._render();
+    }).catch(e=>{
+      entry.loading=false; entry.error=e; entry.at=Date.now();
+      if(isToday){const fb=this._napTimeline(); entry.phase=fb.phase; entry.soothing=fb.soothing;}
+      this._render();
+    });
+    return entry;
+  }
+
+  // Recorder only covers today from whenever it started (a restart, or an
+  // outage that ended mid-day). The integration's own tracker covers the whole
+  // day but has no stirring sub-phases — so splice: tracker before recorder's
+  // first real row, recorder after. Without this the two views of "today"
+  // disagree, one showing naps the other has never heard of.
+  _backfillToday(entry,dayStart){
+    const fb=this._napTimeline();
+    if(!fb.phase.length) return;
+    const ms=e=>new Date(e.last_changed||e.last_updated).getTime();
+    const dayStartMs=dayStart.getTime();
+    // The first row of a history response is the state carried in at the window
+    // edge, stamped at dayStart — not evidence that anything was recorded.
+    const firstReal=entry.phase.find(e=>ms(e)>dayStartMs);
+    const coverMs=firstReal?ms(firstReal):Infinity;
+    const pre=fb.phase.filter(e=>ms(e)<coverMs);
+    if(!pre.length) return;
+    entry.phase=[...pre,...entry.phase.filter(e=>ms(e)>=coverMs)];
+    entry.soothing=[...fb.soothing.filter(e=>ms(e)<coverMs),...(entry.soothing||[]).filter(e=>ms(e)>=coverMs)];
+  }
+
+  // Highest value each daily-total sensor reached on that day.
+  _peakTotals(res,ids){
+    const peak=id=>{
+      const arr=(res||[]).find(a=>a[0]?.entity_id===id);
+      if(!arr) return null;
+      let m=null;
+      for(const e of arr){
+        const v=parseFloat(e.state);
+        if(!isNaN(v)&&(m===null||v>m)) m=v;
+      }
+      return m;
+    };
+    const [sleep,awake,naps,longest,soothes]=ids.map(peak);
+    if(sleep===null&&naps===null) return null;
+    return {
+      total_sleep:String(sleep??0),
+      total_awake:String(awake??0),
+      nap_count:String(naps??0),
+      longest_nap:String(longest??0),
+      soothe_count:String(soothes??0),
+    };
+  }
+
+  // Today's timeline synthesised from the integration's tracker attributes.
+  // Sleep and awake are both intervals the tracker actually observed; anything
+  // outside them stays 'away', because a gap between naps may well have been
+  // time out of the crib rather than awake in it.
+  _napTimeline(){
+    const naps=this._attr(this._config.nap_count,'naps');
+    const awake=this._attr(this._config.nap_count,'awake_periods');
+    const soothes=this._attr(this._config.nap_count,'soothing_events');
+    if(!Array.isArray(naps)) return {phase:[],soothing:[]};
+    const dayStart=new Date(); dayStart.setHours(0,0,0,0);
+    const phase=[{state:'away',last_changed:dayStart.toISOString()}];
+    const add=(list,state)=>{
+      for(const iv of (Array.isArray(list)?list:[])){
+        if(!iv||!iv.start) continue;
+        phase.push({state,last_changed:iv.start});
+        // An interval with no end is still running — leave it open so the
+        // chart carries it to "now" instead of closing it early.
+        if(iv.end) phase.push({state:'away',last_changed:iv.end});
+      }
+    };
+    add(naps,'sleep');
+    add(awake,'awake');
+    phase.sort((a,b)=>new Date(a.last_changed)-new Date(b.last_changed));
+    return {phase,soothing:(Array.isArray(soothes)?soothes:[]).map(ts=>({state:'on',last_changed:ts}))};
+  }
+
+  // Sleep/awake/soothe totals for one day, measured off the timeline itself so
+  // a past day reports that day's numbers rather than today's live sensors.
+  _isToday(d){return this._dayKey(d)===this._dayKey(new Date());}
+
+  // Stats for a day. For today the integration's own sensors ARE the answer —
+  // the same ones the tiles show — so read them rather than recomputing from
+  // the timeline and inevitably landing on a slightly different number.
+  // Only a past day, which no live sensor describes, is measured off history.
+  _dayStats(phase,sooth,date){
+    if(this._isToday(date)){
+      const c=this._config;
+      const sleep=this._st(c.total_sleep), awake=this._st(c.total_awake);
+      const naps=this._st(c.nap_count), longest=this._st(c.longest_nap);
+      const soothes=this._st(c.soothe_count);
+      if(sleep!=null||naps!=null){
+        return {
+          total_sleep:sleep??'0',
+          total_awake:awake??'0',
+          nap_count:naps??'0',
+          longest_nap:longest??'0',
+          soothe_count:soothes??'0',
+        };
+      }
+    }
+    // A past day: prefer what the daily-total sensors actually recorded.
+    const d=this._dayCache?.[this._dayKey(date)];
+    if(d&&d.totals) return d.totals;
+    return this._statsFromTimeline(phase,sooth,date);
+  }
+
+  // Nap list for a day. Today's comes straight from the tracker's own sessions
+  // so the list, the NAPS tile and the summary all describe the same naps.
+  _dayNaps(phase,date){
+    if(this._isToday(date)){
+      const sessions=this._attr(this._config.nap_count,'naps');
+      if(Array.isArray(sessions)&&sessions.length){
+        const now=new Date();
+        return sessions.filter(n=>n&&n.start).map(n=>({
+          start:new Date(n.start),
+          end:n.end?new Date(n.end):now,
+          durMin:Math.round(n.minutes??0),
+          ongoing:!n.end,
+        }));
+      }
+    }
+    return this._deriveNaps(phase);
+  }
+
+  _statsFromTimeline(phase,sooth,date){
+    const dayStart=new Date(date); dayStart.setHours(0,0,0,0);
+    const dayEnd=new Date(dayStart); dayEnd.setDate(dayEnd.getDate()+1);
+    const cutoff=Math.min(dayEnd.getTime(),Date.now());
+    let sleep=0,awake=0;
+    for(let i=0;i<phase.length;i++){
+      const st=phase[i].state;
+      const from=new Date(phase[i].last_changed||phase[i].last_updated).getTime();
+      const to=phase[i+1]
+        ? new Date(phase[i+1].last_changed||phase[i+1].last_updated).getTime()
+        : cutoff;
+      const mins=(Math.min(to,cutoff)-Math.max(from,dayStart.getTime()))/60000;
+      if(mins<=0) continue;
+      // The tracker counts babySleepState==4 only, i.e. 'sleep'. Stirring is
+      // NOT sleep there, so it must not be sleep here either.
+      if(st==='sleep') sleep+=mins;
+      else if(st==='awake'||st==='stirring') awake+=mins;
+    }
+    const naps=this._deriveNaps(phase);
+    const soothes=(sooth||[]).filter(e=>{
+      if(e.state!=='on') return false;
+      const t=new Date(e.last_changed||e.last_updated).getTime();
+      return t>=dayStart.getTime()&&t<dayEnd.getTime();
+    }).length;
+    return {
+      total_sleep:String(Math.round(sleep)),
+      total_awake:String(Math.round(awake)),
+      nap_count:String(naps.length),
+      longest_nap:String(naps.reduce((m,n)=>Math.max(m,n.durMin),0)),
+      soothe_count:String(soothes),
     };
   }
 
@@ -122,18 +279,36 @@ class CradlewiseSleepCard extends HTMLElement {
     if(!this._hass||this._demo) return;
     const c=this._config;
     const dayStart=new Date(); dayStart.setHours(0,0,0,0);
-    const weekAgo=new Date(dayStart); weekAgo.setDate(weekAgo.getDate()-6);
+    const histStart=new Date(dayStart); histStart.setDate(histStart.getDate()-61);
     try {
-      const [dayH,weekH]=await Promise.all([
-        this._hass.callApi('GET',`history/period/${dayStart.toISOString()}?filter_entity_id=${c.sleep_phase},${c.crib_soothing}&minimal_response=true&no_attributes=true`),
-        this._hass.callApi('GET',`history/period/${weekAgo.toISOString()}?filter_entity_id=${c.total_sleep}&minimal_response=true&no_attributes=true`),
-      ]);
-      this._history={phase:dayH?.[0]||[],soothing:dayH?.[1]||[],weekArr:weekH?.[0]||[]};
+      // Day history is owned by _fetchDay; this feeds the week strip AND the
+      // month tab (62 days covers current + previous month). Explicit end_time —
+      // without it the API returns only start+1day, which silently reduced the
+      // week strip to a single day.
+      const weekH=await this._hass.callApi('GET',
+        `history/period/${histStart.toISOString()}?filter_entity_id=${this._pick(c.total_sleep)}`
+        +`&end_time=${encodeURIComponent(new Date(dayStart.getTime()+86400000).toISOString())}`
+        +`&minimal_response=true&no_attributes=true`);
+      this._history={weekArr:weekH?.[0]||[]};
+      this._historyErr=null;
       this._render();
-    } catch(e){console.warn('[sleep-card]',e);}
+    } catch(e){
+      // Recorder/history can be unavailable (DB down, history: not enabled).
+      // Not fatal — the day timeline falls back to the integration's own
+      // nap attributes, so only the week view actually needs history.
+      this._history={weekArr:[]};
+      this._historyErr=e;
+      console.warn('[sleep-card] history unavailable, using live nap attributes',e);
+      this._render();
+    }
   }
 
   _render(){if(!this._hass||!this._config) return; this._demo?this._renderPreview():this._renderMain();}
+
+  // Reads a state, collapsing unavailable/unknown/empty to null so the tiles
+  // show '–' instead of the literal word "unavailable".
+  _st(cand){const e=this._hass?.states[this._pick(cand)];if(!e) return null;const v=e.state;return (v===''||v==null||v==='unavailable'||v==='unknown')?null:v;}
+  _attr(cand,key){return this._hass?.states[this._pick(cand)]?.attributes?.[key];}
 
   _fm(raw){const v=parseFloat(raw);if(isNaN(v)||v<0) return '–';const h=Math.floor(v/60),r=Math.round(v%60);return h===0?`${r}m`:(r===0?`${h}h`:`${h}h ${r}m`);}
   _ft(iso){if(!iso) return '–';try{return new Date(iso).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});}catch{return '–';}}
@@ -142,18 +317,19 @@ class CradlewiseSleepCard extends HTMLElement {
 
   _renderMain(){
     const h=this._hass,c=this._config;
-    const phase=h.states[c.sleep_phase]?.state||'unknown';
+    const phase=this._st(c.sleep_phase)||'unknown';
     const phaseLabel={sleep:'Sleeping',stirring:'Stirring',awake:'Awake',away:'Away',unknown:'–'}[phase]||phase;
     const phaseColor={sleep:'#7b6ed6',stirring:'#f5cc78',awake:'#f9a12d',away:'#aaa',unknown:'#aaa'}[phase]||'#aaa';
     const s={
-      sleep:h.states[c.total_sleep]?.state, awake:h.states[c.total_awake]?.state,
-      soothes:h.states[c.soothe_count]?.state, naps:h.states[c.nap_count]?.state,
-      longest:h.states[c.longest_nap]?.state,
+      sleep:this._st(c.total_sleep), awake:this._st(c.total_awake),
+      soothes:this._st(c.soothe_count), naps:this._st(c.nap_count),
+      longest:this._st(c.longest_nap),
     };
 
     // Week bars data
     const weekBars=this._buildWeekBars();
     const maxBar=Math.max(...weekBars.map(b=>b.v),1);
+    const monthData=this._mainTab==='month'?this._buildMonthCells():null;
 
     const barHtml=weekBars.map((b,i)=>{
       const pct=Math.round((b.v/maxBar)*100);
@@ -173,7 +349,7 @@ class CradlewiseSleepCard extends HTMLElement {
 
     this.shadowRoot.innerHTML=`<style>
       :host{display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
-      .outer{background:${C.bg};border-radius:20px;padding:16px 14px 20px}
+      .outer{background:${C.bg};border-radius:20px;padding:16px 14px 20px;min-height:calc(100dvh - var(--header-height,56px));box-sizing:border-box}
       .hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
       .title{font-size:20px;font-weight:700;color:${C.textDark}}
       .badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;background:rgba(37,20,98,0.08);color:${phaseColor}}
@@ -199,9 +375,20 @@ class CradlewiseSleepCard extends HTMLElement {
       .bb{width:100%;border-radius:4px 4px 0 0;transition:background .15s,box-shadow .15s}
       .bv{font-size:9px;line-height:1.2;height:12px}
       .bl{font-size:10px}
+      .wnote{margin-top:14px;text-align:center;font-size:11px;color:${C.textGray}}
       /* Month view */
-      .month-ph{text-align:center;padding:32px 16px;color:${C.textGray};font-size:14px}
-      .month-ph .mico{font-size:48px;margin-bottom:12px}
+      .mnav{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+      .mnavb{border:none;background:transparent;font-size:18px;color:${C.textDark};cursor:pointer;padding:6px 14px;font-family:inherit}
+      .mnavb:disabled{opacity:.25;cursor:default}
+      .mnavt{font-size:16px;font-weight:700;color:${C.textDark}}
+      .mgrid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+      .mhead{text-align:center;font-size:11px;font-weight:600;color:${C.textGray};padding:4px 0}
+      .mcell{background:rgba(37,20,98,0.05);border-radius:10px;padding:6px 2px;text-align:center;min-height:52px}
+      .mcell.mtod{background:rgba(37,20,98,0.13);outline:2px solid #7b6ed6}
+      .mcell.mfuture{opacity:.35}
+      .mdn{font-size:11px;color:${C.textGray};font-weight:600}
+      .mval{font-size:11px;font-weight:700;color:#7b6ed6;margin-top:3px}
+      .mnote{text-align:center;font-size:11px;color:#bbb;margin-top:10px}
     </style>
     <div class="outer">
       <div class="hdr">
@@ -216,39 +403,57 @@ class CradlewiseSleepCard extends HTMLElement {
       ${isDay?`
         <div class="sg">
           <div class="sp"><div class="sv">${this._fm(s.sleep)}</div><div class="sl">Sleep</div></div>
-          <div class="sp"><div class="sv">${s.naps||'–'}</div><div class="sl">Naps</div></div>
-          <div class="sp"><div class="sv">${s.soothes||'–'}</div><div class="sl">Soothes</div></div>
+          <div class="sp"><div class="sv">${s.naps??'–'}</div><div class="sl">Naps</div></div>
+          <div class="sp"><div class="sv">${s.soothes??'–'}</div><div class="sl">Soothes</div></div>
         </div>
         <div class="sg2">
           <div class="sp"><div class="sv">${this._fm(s.longest)}</div><div class="sl">Longest Nap</div></div>
           <div class="sp"><div class="sv">${this._fm(s.awake)}</div><div class="sl">Awake</div></div>
         </div>
-        <canvas id="lc" height="180"></canvas>
+        <canvas id="lc" style="display:block;width:100%"></canvas>
         <div class="leg">
           <div class="li"><div class="lsq" style="background:${C.sleep}"></div>SLEEP</div>
           <div class="li"><div class="lsq" style="background:${C.stirring}"></div>STIRRING</div>
           <div class="li"><div class="lsq" style="background:${C.awake}"></div>AWAKE</div>
           <div class="li"><div class="lsq" style="background:${C.soothe};border-radius:50%"></div>SOOTHES</div>
         </div>
-        <button class="pbtn" id="pbtn">Preview sleep chart</button>
+        <button class="pbtn" id="pbtn">Sleep chart &amp; history</button>
       `:''}
       ${isWeek?`
         <div class="week-wrap">
           <div class="wbars">${barHtml}</div>
+          ${(this._history?.weekArr||[]).length===0?`
+            <div class="wnote">No recorder history — showing today only.</div>
+          `:''}
         </div>
       `:''}
-      ${this._mainTab==='month'?`
-        <div class="month-ph">
-          <div class="mico">📅</div>
-          <div>Monthly overview coming soon</div>
-          <div style="font-size:12px;margin-top:6px;color:#bbb">Real data from your crib</div>
+      ${monthData?`
+        <div class="mnav">
+          <button class="mnavb" data-action="mnav" data-d="-1">◀</button>
+          <div class="mnavt">${monthData.mStart.toLocaleString('default',{month:'long',year:'numeric'})}</div>
+          <button class="mnavb" data-action="mnav" data-d="1" ${this._monthOffset>=0?'disabled':''}>▶</button>
         </div>
+        <div class="mgrid">
+          ${['S','M','T','W','T','F','S'].map(l=>`<div class="mhead">${l}</div>`).join('')}
+          ${monthData.cells.map(cl=> cl===null?'<div class="mcell"></div>':`
+            <div class="mcell${cl.isToday?' mtod':''}${cl.fut?' mfuture':''}">
+              <div class="mdn">${cl.n}</div>
+              <div class="mval">${(!cl.fut&&cl.v>0)?this._fm(cl.v):''}</div>
+            </div>`).join('')}
+        </div>
+        <div class="mnote">Each day = total sleep 8 AM → 8 AM (the crib's sleep-day). ◀ shows the previous month.</div>
       `:''}
     </div>`;
 
     this.shadowRoot.getElementById('t-day').addEventListener('click',()=>{this._mainTab='day';this._render();});
     this.shadowRoot.getElementById('t-week').addEventListener('click',()=>{this._mainTab='week';this._render();});
     this.shadowRoot.getElementById('t-month').addEventListener('click',()=>{this._mainTab='month';this._render();});
+    this.shadowRoot.querySelectorAll('[data-action="mnav"]').forEach(el=>el.addEventListener('click',()=>{
+      if(el.disabled) return;
+      this._monthOffset+=parseInt(el.dataset.d)||0;
+      if(this._monthOffset>0) this._monthOffset=0;
+      this._render();
+    }));
     this.shadowRoot.getElementById('pbtn')?.addEventListener('click',()=>{this._demo=true;this._weekOffset=0;this._selectedDayIdx=6;this._render();});
 
     // Week bar clicks
@@ -260,30 +465,58 @@ class CradlewiseSleepCard extends HTMLElement {
 
     // Draw live C-shape
     if(isDay){
-      const ph=this._history?.phase||[];
-      const sh=this._history?.soothing||[];
-      requestAnimationFrame(()=>this._drawC(ph,sh,'lc',false));
+      const tl=this._dayTimeline();
+      requestAnimationFrame(()=>this._drawC(tl.phase,tl.soothing,'lc',false));
       if(!this._resizeObserver){
         this._resizeObserver=new ResizeObserver(()=>{
-          if(!this._demo&&this._mainTab==='day') requestAnimationFrame(()=>this._drawC(this._history?.phase||[],this._history?.soothing||[],'lc',false));
+          if(!this._demo&&this._mainTab==='day'){
+            const t=this._dayTimeline();
+            requestAnimationFrame(()=>this._drawC(t.phase,t.soothing,'lc',false));
+          }
         });
         this._resizeObserver.observe(this);
       }
     }
   }
 
+  // Today's phase/soothe timeline for the day chart.
+  //
+  // Recorder history is the richer source (it has stirring sub-phases), but it
+  // is not always there. The integration also publishes today's nap sessions
+  // and soothe timestamps as attributes on the nap-count sensor, so fall back
+  // to those and synthesise the same {state,last_changed} shape _drawC wants.
+  // The compact day chart and the detail view share one cache entry, so they
+  // can never show different versions of the same day.
+  _dayTimeline(){
+    const d=this._fetchDay(new Date());
+    if((d.phase||[]).length) return {phase:d.phase,soothing:d.soothing||[]};
+    return this._napTimeline();
+  }
+
+  _byDayTotals(){
+    // total-sleep history keyed by SLEEP-DAY start (8am–8am, the crib's day):
+    // a state at 3am belongs to the sleep-day that started the prior morning.
+    // Rows ascend, so the last write per sleep-day = that day's final total.
+    const arr=this._history?.weekArr||[];
+    const byDay={};
+    for(const e of arr){
+      const d=new Date(e.last_changed||e.last_updated);
+      const v=parseFloat(e.state); if(isNaN(v)) continue;
+      const sd=new Date(d); if(sd.getHours()<8) sd.setDate(sd.getDate()-1);
+      sd.setHours(0,0,0,0);
+      const k=`${sd.getFullYear()}-${sd.getMonth()}-${sd.getDate()}`;
+      byDay[k]=v;
+    }
+    return byDay;
+  }
+
   _buildWeekBars(){
-    const h=this._hass,c=this._config;
+    const c=this._config;
     const today=new Date();
     // Try to use live history
     const arr=this._history?.weekArr||[];
     if(arr.length>0){
-      const byDay={};
-      for(const e of arr){
-        const d=new Date(e.last_changed||e.last_updated);
-        const k=`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
-        const v=parseFloat(e.state); if(!isNaN(v)) byDay[k]=v;
-      }
+      const byDay=this._byDayTotals();
       const DAYS=[];
       for(let i=6;i>=0;i--){
         const d=new Date(today); d.setDate(d.getDate()-i);
@@ -292,13 +525,38 @@ class CradlewiseSleepCard extends HTMLElement {
       }
       if(DAYS.some(b=>b.v>0)) return DAYS;
     }
-    // Fallback demo
-    const VALS=[480,510,420,495,540,504,330];
-    return VALS.map((v,idx)=>{
-      const i=6-idx;
+    // No recorder history. Show today's real total from the live sensor and
+    // leave the other days empty — never invent numbers, they read as real.
+    const todayVal=parseFloat(this._st(c.total_sleep));
+    const DAYS=[];
+    for(let i=6;i>=0;i--){
       const d=new Date(today); d.setDate(d.getDate()-i);
-      return {label:d.toLocaleDateString([],{weekday:'short'}).slice(0,2),v,isToday:i===0};
-    });
+      DAYS.push({
+        label:d.toLocaleDateString([],{weekday:'short'}).slice(0,2),
+        v:(i===0&&!isNaN(todayVal))?todayVal:0,
+        isToday:i===0,
+      });
+    }
+    return DAYS;
+  }
+
+  _buildMonthCells(){
+    // Calendar grid for the visible month; cell values are sleep-day totals.
+    const byDay=this._byDayTotals();
+    const today=new Date();
+    const t0=new Date(today.getFullYear(),today.getMonth(),today.getDate());
+    const mStart=new Date(today.getFullYear(), today.getMonth()+this._monthOffset, 1);
+    const firstDow=mStart.getDay();
+    const dim=new Date(mStart.getFullYear(), mStart.getMonth()+1, 0).getDate();
+    const cells=[];
+    for(let i=0;i<firstDow;i++) cells.push(null);
+    for(let dn=1; dn<=dim; dn++){
+      const d=new Date(mStart.getFullYear(), mStart.getMonth(), dn);
+      const k=`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+      const isToday=d.getTime()===t0.getTime();
+      cells.push({n:dn, v:byDay[k], fut:d.getTime()>t0.getTime(), isToday});
+    }
+    return {mStart, cells};
   }
 
   // ── Preview view ──────────────────────────────────────────────────────────
@@ -316,14 +574,16 @@ class CradlewiseSleepCard extends HTMLElement {
     const selDay=days[this._selectedDayIdx];
     const selDate=selDay.d;
 
-    // Generate or fetch demo data for selected day
-    const demo=makeDayDemo(selDate);
-    const phaseHist=demo.phase;
-    const soothHist=demo.soothing;
-    const stats=demo.stats;
+    // Real history for the selected day (async; re-renders when it lands)
+    const day=this._fetchDay(selDate);
+    const phaseHist=day.phase||[];
+    const soothHist=day.soothing||[];
+    const stats=this._dayStats(phaseHist,soothHist,selDate);
+    const hasData=phaseHist.some(e=>e.state==='sleep'||e.state==='stirring'||e.state==='awake');
+    const isPastDay=this._dayKey(selDate)!==this._dayKey(new Date());
 
     const isChart=this._chartTab==='chart';
-    const naps=this._deriveNaps(phaseHist);
+    const naps=this._dayNaps(phaseHist,selDate);
     const inBedMin=(parseInt(stats.total_sleep)||0)+(parseInt(stats.total_awake)||0);
 
     // Month/year label from week window
@@ -338,8 +598,18 @@ class CradlewiseSleepCard extends HTMLElement {
       </div>`;
     }).join('');
 
+    // Past days keep only the daily totals — the individual nap start/end times
+    // live in the tracker, which resets at midnight. So when the totals say the
+    // day had naps but the timeline can't itemise them, say that, rather than
+    // "no sleep" directly under a summary crediting hours of it.
+    const totalNaps=parseInt(stats.nap_count)||0;
+    const emptyMsg=day.loading
+      ?'Loading…'
+      :(totalNaps>0
+        ? `${totalNaps} nap${totalNaps===1?'':'s'} totalling ${this._fm(stats.total_sleep)} were recorded this day, but the per-nap times weren't stored.`
+        : 'No sleep recorded on this day');
     const listHtml=naps.length===0
-      ?`<div class="nonaps">No sleep data for this day</div>`
+      ?`<div class="nonaps">${emptyMsg}</div>`
       :naps.map((n,i)=>{
           const bd=this._napBreakdown(n,phaseHist,soothHist);
           const open=this._expandedNapIdx===i;
@@ -369,7 +639,7 @@ class CradlewiseSleepCard extends HTMLElement {
 
     this.shadowRoot.innerHTML=`<style>
       :host{display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
-      .outer{background:${C.bg};border-radius:20px;overflow:hidden;padding-bottom:20px}
+      .outer{background:${C.bg};border-radius:20px;overflow-x:hidden;overflow-y:auto;-webkit-overflow-scrolling:touch;padding-bottom:20px;min-height:calc(100dvh - var(--header-height,56px));box-sizing:border-box;display:flex;flex-direction:column}
       .topbar{display:flex;align-items:center;padding:14px 14px 8px;gap:8px}
       .back{background:none;border:none;font-size:24px;cursor:pointer;color:${C.textDark};padding:0;line-height:1;font-family:inherit}
       .ptitle{font-size:17px;font-weight:700;color:${C.textDark};flex:1}
@@ -400,7 +670,7 @@ class CradlewiseSleepCard extends HTMLElement {
       .stab{flex:1;text-align:center;padding:8px 0;font-size:13px;font-weight:500;border-radius:10px;cursor:pointer;border:none;font-family:inherit;background:rgba(37,20,98,.07);color:${C.textGray};transition:all .2s}
       .stab.act{background:#fff;color:${C.textDark};font-weight:600;box-shadow:0 1px 6px rgba(0,0,0,.1)}
       /* Chart */
-      .ccard{margin:0 10px 12px;background:#fff;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.07);padding:12px 6px 10px;overflow:hidden}
+      .ccard{margin:0 10px 12px;background:#fff;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.07);padding:12px 6px 10px;overflow:hidden;flex:1;min-height:200px;display:flex;flex-direction:column}
       .cdl{display:flex;justify-content:space-between;padding:0 6px 8px;font-size:11px;font-weight:600;color:${C.textGray};text-transform:uppercase;letter-spacing:.5px}
       canvas#ct{display:block;width:100%;cursor:crosshair}
       .leg{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;padding:8px 0 0;font-size:10px;color:${C.textGray};letter-spacing:.4px}
@@ -434,7 +704,7 @@ class CradlewiseSleepCard extends HTMLElement {
     <div class="outer">
       <div class="topbar">
         <button class="back" id="back">‹</button>
-        <div class="ptitle">Preview</div>
+        <div class="ptitle">${selDate.toLocaleDateString([],{weekday:'long',month:'short',day:'numeric'})}</div>
       </div>
       <div class="mlab">
         <button class="mnav" id="prev-week" ${this._weekOffset<=-104?'disabled':''}>◀</button>
@@ -459,13 +729,18 @@ class CradlewiseSleepCard extends HTMLElement {
         <button class="stab ${isChart?'act':''}" id="tc">Chart</button>
         <button class="stab ${!isChart?'act':''}" id="tl">List</button>
       </div>
-      ${isChart?`
+      ${isChart&&!hasData?`
+        <div class="ccard" style="align-items:center;justify-content:center">
+          <div class="nonaps">${day.loading?'Loading…':(day.error?'History unavailable for this day':emptyMsg)}</div>
+        </div>
+      `:''}
+      ${isChart&&hasData?`
         <div class="ccard">
           <div class="cdl">
             <span>${selDay.letter} ${selDate.toLocaleString('default',{month:'short'}).toUpperCase()} ${selDay.num}, 8 AM</span>
             <span>8 AM</span>
           </div>
-          <canvas id="ct" height="260"></canvas>
+          <canvas id="ct" style="display:block;width:100%;cursor:crosshair"></canvas>
           <div class="leg">
             <div class="li"><div class="lsq" style="background:${C.sleep}"></div>SLEEP</div>
             <div class="li"><div class="lsq" style="background:${C.stirring}"></div>STIRRING</div>
@@ -530,8 +805,8 @@ class CradlewiseSleepCard extends HTMLElement {
       const i=parseInt(el.dataset.ni); this._expandedNapIdx=this._expandedNapIdx===i?null:i; this._renderPreview();
     }));
 
-    if(isChart){
-      requestAnimationFrame(()=>this._drawC(phaseHist,soothHist,'ct',true));
+    if(isChart&&hasData){
+      requestAnimationFrame(()=>this._drawC(phaseHist,soothHist,'ct',isPastDay));
       // Tap-to-tooltip on canvas
       const canvas=this.shadowRoot.getElementById('ct');
       if(canvas){
@@ -565,14 +840,14 @@ class CradlewiseSleepCard extends HTMLElement {
           } else {
             this._cTooltip={t,timeStr,stateLabel,stateCol};
           }
-          this._drawC(phaseHist,soothHist,'ct',true);
+          this._drawC(phaseHist,soothHist,'ct',isPastDay);
         };
         canvas.addEventListener('click',handleTap);
         canvas.addEventListener('touchend',handleTap,{passive:false});
       }
       if(!this._resizeObserver){
         this._resizeObserver=new ResizeObserver(()=>{
-          if(this._demo&&this._chartTab==='chart') requestAnimationFrame(()=>this._drawC(phaseHist,soothHist,'ct',true));
+          if(this._demo&&this._chartTab==='chart'&&hasData) requestAnimationFrame(()=>this._drawC(phaseHist,soothHist,'ct',isPastDay));
         });
         this._resizeObserver.observe(this);
       }
@@ -587,18 +862,33 @@ class CradlewiseSleepCard extends HTMLElement {
 
     const dpr=window.devicePixelRatio||1;
     const W=canvas.offsetWidth||330;
-    const H=canvasId==='lc'?180:260;
+    // Preview H purely from W (app: startY=W/3, ideal height ~W*4/3).
+    // Never read canvas.offsetHeight — stale inline style.height poisons it across re-renders.
+    const H=canvasId==='lc'
+      ? Math.max(120, Math.min(180, Math.round(W*0.52)))
+      : Math.round(W*1.3);
     canvas.width=W*dpr; canvas.height=H*dpr;
-    canvas.style.width=W+'px'; canvas.style.height=H+'px';
+    canvas.style.width=W+'px';
+    canvas.style.height=H+'px'; // fix display size; .ccard flex:1 fills remaining space in .outer
     const ctx=canvas.getContext('2d'); ctx.scale(dpr,dpr);
 
-    const TK=canvasId==='lc'?15:20;
-    const topY=canvasId==='lc'?30:44;
+    // Track thickness: W-based so it stays stable regardless of H
+    const TK=canvasId==='lc'
+      ? Math.max(10, Math.min(28, Math.round(W*0.043)))
+      : Math.max(40, Math.min(100, Math.round(W*0.13)));
+
+    // Geometry: topY=W/3 matches app (app uses startY=canvasWidth/3).
+    // lc (small day-view canvas): H≈0.52W so topY must use H-basis to keep botY>topY.
+    // Main preview canvas: H=1.3W so W/3<H/2 is fine.
+    const topY=canvasId==='lc'
+      ? Math.max(TK/2+5, Math.round(H*0.22))
+      : Math.max(TK/2+10, Math.round(W/3));
     const botY=H-topY;
     const cy=(topY+botY)/2;
     const R=(botY-topY)/2;
-    const cx=W-R-20;
-    const lx=22;
+    if(R<=0) return; // guard: shouldn't happen after fix, but skip if degenerate
+    const lx=TK/2+8;
+    const cx=W-R-TK/2-10; // outer arc edge = W-10
 
     this._geom={leftX:lx,topY,botY,cy,R,cx,W,H,TK};
 
@@ -626,12 +916,13 @@ class CradlewiseSleepCard extends HTMLElement {
     // Background track
     ctx.beginPath(); ctx.moveTo(lx,topY); ctx.lineTo(cx,topY);
     ctx.arc(cx,cy,R,-Math.PI/2,Math.PI/2); ctx.lineTo(lx,botY);
-    ctx.strokeStyle=C.trackBg; ctx.lineWidth=TK+8; ctx.lineCap='round'; ctx.stroke();
+    ctx.strokeStyle=C.trackBg; ctx.lineWidth=TK+4; ctx.lineCap='round'; ctx.stroke();
 
-    // Phase segments — use the date of the first history entry as dayStart
+    // Phase segments
     const dayStart=new Date();
     if(phaseHist.length>0){const ref=new Date(phaseHist[0].last_changed||phaseHist[0].last_updated);dayStart.setFullYear(ref.getFullYear(),ref.getMonth(),ref.getDate());}
     dayStart.setHours(0,0,0,0);
+    // Full 24h for a completed day; stop at "now" for a day still in progress.
     const nowMs=isDemo?24*3600000:(Date.now()-dayStart);
     for(let i=0;i<phaseHist.length;i++){
       const e=phaseHist[i],next=phaseHist[i+1];
@@ -644,86 +935,119 @@ class CradlewiseSleepCard extends HTMLElement {
       stroke(t0,t1,col,TK,'butt');
     }
 
-    // Tick labels (skip for small canvas)
     if(canvasId!=='lc'){
-      ctx.fillStyle='#999';
+      // ── Tick marks on inner edge (every 30 min) ──────────────────
+      ctx.lineCap='butt';
+      for(let h=0;h<=24;h+=0.5){
+        const isMajor=(h%1===0);
+        const tlen=isMajor?7:4;
+        ctx.strokeStyle=isMajor?'rgba(37,20,98,.30)':'rgba(37,20,98,.18)';
+        ctx.lineWidth=isMajor?1.5:1;
+        if(h<=6){
+          const x=lx+(h/6)*(cx-lx), iy=topY+TK/2;
+          ctx.beginPath();ctx.moveTo(x,iy);ctx.lineTo(x,iy+tlen);ctx.stroke();
+        } else if(h<=18){
+          const a=-Math.PI/2+((h-6)/12)*Math.PI;
+          const ir=R-TK/2;
+          ctx.beginPath();ctx.moveTo(cx+ir*Math.cos(a),cy+ir*Math.sin(a));ctx.lineTo(cx+(ir-tlen)*Math.cos(a),cy+(ir-tlen)*Math.sin(a));ctx.stroke();
+        } else {
+          const x=cx-((h-18)/6)*(cx-lx), iy=botY-TK/2;
+          ctx.beginPath();ctx.moveTo(x,iy);ctx.lineTo(x,iy-tlen);ctx.stroke();
+        }
+      }
+
+      // ── Time labels on inner edge ─────────────────────────────────
+      ctx.fillStyle='#888';
       ctx.font=`bold 9px -apple-system,sans-serif`;
-      const topLbls=[{t:0,lbl:'8 AM'},{t:3,lbl:'11 AM'},{t:6,lbl:'2 PM'}];
-      const botLbls=[{t:18,lbl:'2 AM'},{t:21,lbl:'5 AM'},{t:24,lbl:'8 AM'}];
-      const arcLbls=[{t:9,lbl:'5 PM'},{t:12,lbl:'8 PM'},{t:15,lbl:'11 PM'}];
-      for(const{t,lbl}of topLbls){const[px2,py2]=pt(t);ctx.textAlign=t===0?'left':(t===6?'right':'center');ctx.textBaseline='bottom';ctx.fillText(lbl,t===0?px2+2:(t===6?px2-2:px2),py2-TK/2-3);}
-      for(const{t,lbl}of botLbls){const[px2,py2]=pt(t);ctx.textAlign=t===18?'right':(t===24?'left':'center');ctx.textBaseline='top';ctx.fillText(lbl,t===18?px2-2:(t===24?px2+2:px2),py2+TK/2+3);}
-      for(const{t,lbl}of arcLbls){const a=-Math.PI/2+((t-6)/12)*Math.PI;const offs=TK/2+14;ctx.textAlign='left';ctx.textBaseline='middle';ctx.fillText(lbl,cx+(R+offs)*Math.cos(a),cy+(R+offs)*Math.sin(a));}
-      // Tick marks
-      ctx.strokeStyle='rgba(37,20,98,.15)'; ctx.lineWidth=1; ctx.lineCap='square';
-      for(const t of[0,3,6,9,12,15,18,21,24]){
-        const[px2,py2]=pt(t);
-        if(t<=6){ctx.beginPath();ctx.moveTo(px2,py2-TK/2);ctx.lineTo(px2,py2-TK/2-5);ctx.stroke();}
-        else if(t<=18){const a=-Math.PI/2+((t-6)/12)*Math.PI;ctx.beginPath();ctx.moveTo(cx+(R+TK/2)*Math.cos(a),cy+(R+TK/2)*Math.sin(a));ctx.lineTo(cx+(R+TK/2+5)*Math.cos(a),cy+(R+TK/2+5)*Math.sin(a));ctx.stroke();}
-        else{ctx.beginPath();ctx.moveTo(px2,py2+TK/2);ctx.lineTo(px2,py2+TK/2+5);ctx.stroke();}
+      // Top track: labels below track (inner = bottom of track)
+      for(const{t,lbl,al}of[{t:0,lbl:'8 AM',al:'left'},{t:3,lbl:'11 AM',al:'center'},{t:6,lbl:'2 PM',al:'right'}]){
+        const x=lx+(t/6)*(cx-lx);
+        ctx.textAlign=al; ctx.textBaseline='top';
+        ctx.fillText(lbl,t===0?x+2:t===6?x-2:x, topY+TK/2+10);
+      }
+      // Bottom track: labels above track (inner = top of track)
+      for(const{t,lbl,al}of[{t:18,lbl:'2 AM',al:'right'},{t:21,lbl:'5 AM',al:'center'},{t:24,lbl:'8 AM',al:'left'}]){
+        const x=cx-((t-18)/6)*(cx-lx);
+        ctx.textAlign=al; ctx.textBaseline='bottom';
+        ctx.fillText(lbl,t===18?x-2:t===24?x+2:x, botY-TK/2-10);
+      }
+      // Arc labels: on inner face (facing hollow), right-aligned toward center
+      for(const{t,lbl}of[{t:9,lbl:'5 PM'},{t:12,lbl:'8 PM'},{t:15,lbl:'11 PM'}]){
+        const a=-Math.PI/2+((t-6)/12)*Math.PI;
+        const ir=R-TK/2-14;
+        ctx.textAlign='right'; ctx.textBaseline='middle';
+        ctx.fillText(lbl,cx+ir*Math.cos(a),cy+ir*Math.sin(a));
+      }
+
+      // ── Soothe dots on outer edge with stem ───────────────────────
+      const dotR=Math.max(5,Math.round(TK*0.13));
+      for(const e of(soothHist||[])){
+        if(e.state!=='on') continue;
+        const eMs=new Date(e.last_changed||e.last_updated)-dayStart;
+        if(eMs<0||eMs>nowMs) continue;
+        let t=eMs/3600000-8; if(t<0)t+=24; t=Math.max(0,Math.min(24,t));
+        let ox,oy,sx2,sy2; // outer edge point and dot center
+        const stemLen=dotR+6;
+        if(t<=6){
+          ox=lx+(t/6)*(cx-lx); oy=topY-TK/2;
+          sx2=ox; sy2=oy-stemLen;
+        } else if(t<=18){
+          const a=-Math.PI/2+((t-6)/12)*Math.PI;
+          const or2=R+TK/2;
+          ox=cx+or2*Math.cos(a); oy=cy+or2*Math.sin(a);
+          sx2=cx+(or2+stemLen)*Math.cos(a); sy2=cy+(or2+stemLen)*Math.sin(a);
+        } else {
+          ox=cx-((t-18)/6)*(cx-lx); oy=botY+TK/2;
+          sx2=ox; sy2=oy+stemLen;
+        }
+        // stem line
+        ctx.beginPath();ctx.moveTo(ox,oy);ctx.lineTo(sx2,sy2);
+        ctx.strokeStyle=C.soothe;ctx.lineWidth=1.5;ctx.lineCap='round';ctx.stroke();
+        // dot
+        ctx.beginPath();ctx.arc(sx2,sy2,dotR,0,Math.PI*2);
+        ctx.fillStyle=C.soothe;ctx.fill();
       }
     } else {
-      // Minimal time labels for small canvas
-      ctx.fillStyle='#aaa'; ctx.font='8px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='bottom';
-      for(const{t,l}of[{t:0,l:'8AM'},{t:6,l:'2PM'},{t:12,l:'8PM'},{t:24,l:'8AM'}]){
+      // Minimal labels for small main canvas
+      ctx.fillStyle='#aaa'; ctx.font='8px sans-serif';
+      for(const{t,l,al,bl}of[{t:0,l:'8AM',al:'left',bl:'top'},{t:6,l:'2PM',al:'right',bl:'top'},{t:24,l:'8AM',al:'left',bl:'bottom'}]){
         const[px2,py2]=pt(t);
-        if(t<=6){ctx.fillText(l,px2,py2-TK/2-2);}
-        else if(t===12){ctx.fillText(l,cx+R+14,cy);}
-        else{ctx.textBaseline='top';ctx.fillText(l,px2,py2+TK/2+2);ctx.textBaseline='bottom';}
+        ctx.textAlign=al;ctx.textBaseline=bl;
+        if(t<=6) ctx.fillText(l,t===0?px2+2:px2-2,topY+TK/2+3);
+        else ctx.fillText(l,px2+2,botY-TK/2-3);
       }
     }
 
-    // Soothe dots
-    for(const e of(soothHist||[])){
-      if(e.state!=='on') continue;
-      const eMs=new Date(e.last_changed||e.last_updated)-dayStart;
-      if(eMs<0||eMs>nowMs) continue;
-      let t=eMs/3600000-8; if(t<0)t+=24; t=Math.max(0,Math.min(24,t));
-      const[px2,py2]=pt(t);
-      ctx.beginPath();ctx.arc(px2,py2,TK/2*0.8+2,0,Math.PI*2);ctx.fillStyle='rgba(239,83,80,.2)';ctx.fill();
-      ctx.beginPath();ctx.arc(px2,py2,4,0,Math.PI*2);ctx.fillStyle=C.soothe;ctx.fill();
-      ctx.beginPath();ctx.arc(px2,py2,4,0,Math.PI*2);ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.stroke();
-    }
-
-    // Bed-time start marker
-    const firstIn=phaseHist.find(e=>e.state==='sleep'||e.state==='stirring');
-    if(firstIn){
-      const eMs=new Date(firstIn.last_changed||firstIn.last_updated)-dayStart;
-      let t=eMs/3600000-8; if(t<0)t+=24; t=Math.max(0,Math.min(24,t));
-      const[px2,py2]=pt(t);
-      ctx.beginPath();ctx.arc(px2,py2,6,0,Math.PI*2);ctx.fillStyle=C.inBed;ctx.fill();
-      ctx.beginPath();ctx.arc(px2,py2,6,0,Math.PI*2);ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
+    // Bed-time start marker (dot on track at first sleep)
+    if(canvasId==='ct'){
+      const firstIn=phaseHist.find(e=>e.state==='sleep'||e.state==='stirring');
+      if(firstIn){
+        const eMs=new Date(firstIn.last_changed||firstIn.last_updated)-dayStart;
+        let t=eMs/3600000-8; if(t<0)t+=24; t=Math.max(0,Math.min(24,t));
+        const[px2,py2]=pt(t);
+        ctx.beginPath();ctx.arc(px2,py2,Math.max(6,TK*0.12),0,Math.PI*2);ctx.fillStyle=C.inBed;ctx.fill();
+        ctx.beginPath();ctx.arc(px2,py2,Math.max(6,TK*0.12),0,Math.PI*2);ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
+      }
     }
 
     // ── Tap tooltip ──
     if(this._cTooltip&&canvasId==='ct'){
       const{t:tt,timeStr,stateLabel,stateCol}=this._cTooltip;
       const[px2,py2]=pt(tt);
-
-      // Highlight dot on track
       ctx.beginPath();ctx.arc(px2,py2,TK/2+3,0,Math.PI*2);ctx.fillStyle='rgba(255,255,255,.25)';ctx.fill();
       ctx.beginPath();ctx.arc(px2,py2,5,0,Math.PI*2);ctx.fillStyle='#fff';ctx.fill();
       ctx.beginPath();ctx.arc(px2,py2,5,0,Math.PI*2);ctx.strokeStyle=stateCol;ctx.lineWidth=2;ctx.stroke();
-
-      // Callout bubble — place inside the C (upper-left hollow area)
-      const bW=128,bH=44,bX=lx+2,bY=topY+TK/2+10;
+      // Callout bubble inside the C hollow
+      const bW=128,bH=44,bX=lx+2,bY=topY+TK/2+14;
       ctx.beginPath();
       if(ctx.roundRect) ctx.roundRect(bX,bY,bW,bH,8);
       else{const r=8;ctx.moveTo(bX+r,bY);ctx.lineTo(bX+bW-r,bY);ctx.quadraticCurveTo(bX+bW,bY,bX+bW,bY+r);ctx.lineTo(bX+bW,bY+bH-r);ctx.quadraticCurveTo(bX+bW,bY+bH,bX+bW-r,bY+bH);ctx.lineTo(bX+r,bY+bH);ctx.quadraticCurveTo(bX,bY+bH,bX,bY+bH-r);ctx.lineTo(bX,bY+r);ctx.quadraticCurveTo(bX,bY,bX+r,bY);ctx.closePath();}
       ctx.fillStyle='rgba(26,26,46,0.92)';ctx.fill();
-
       ctx.textAlign='left';ctx.textBaseline='middle';
-      ctx.fillStyle='#fff';ctx.font=`bold 11px -apple-system,sans-serif`;
-      ctx.fillText(timeStr,bX+10,bY+14);
-      ctx.fillStyle=stateCol;ctx.font=`10px -apple-system,sans-serif`;
-      ctx.fillText(stateLabel,bX+10,bY+30);
-
-      // Line from bubble to dot
+      ctx.fillStyle='#fff';ctx.font=`bold 11px -apple-system,sans-serif`;ctx.fillText(timeStr,bX+10,bY+14);
+      ctx.fillStyle=stateCol;ctx.font=`10px -apple-system,sans-serif`;ctx.fillText(stateLabel,bX+10,bY+30);
       ctx.strokeStyle='rgba(255,255,255,.4)';ctx.lineWidth=1;ctx.setLineDash([3,3]);
-      ctx.beginPath();
-      const nearX=Math.min(bX+bW, Math.max(bX, px2));
-      ctx.moveTo(nearX,bY+bH);ctx.lineTo(px2,py2-TK/2-2);
-      ctx.stroke();ctx.setLineDash([]);
+      ctx.beginPath();const nearX=Math.min(bX+bW,Math.max(bX,px2));ctx.moveTo(nearX,bY+bH);ctx.lineTo(px2,py2-TK/2-2);ctx.stroke();ctx.setLineDash([]);
     }
   }
 
@@ -779,20 +1103,31 @@ class CradlewiseSleepCard extends HTMLElement {
 
   // ── Nap utilities ─────────────────────────────────────────────────────────
 
+  // Naps for a past day, using exactly the tracker's rule: a nap runs while
+  // babySleepState is 'sleep' and ends at the first non-sleep state (stirring
+  // included), with sub-minute blips discarded. Deliberately NOT coalesced —
+  // the tracker doesn't coalesce, and stitching here made the same day report
+  // 11 naps in one view and 13 in another.
   _deriveNaps(ph){
     if(!ph.length) return [];
-    const now=new Date(),naps=[];
+    const MIN_NAP_MIN=1;   // matches _MIN_NAP_MINUTES in the integration
+    const now=new Date();
+    const naps=[];
     let start=null;
     for(const e of ph){
-      const isSleep=e.state==='sleep'||e.state==='stirring';
+      const isSleep=e.state==='sleep';
       const ts=new Date(e.last_changed||e.last_updated);
-      if(isSleep&&start===null){start=ts;}
+      if(isSleep&&start===null) start=ts;
       else if(!isSleep&&start!==null){
-        const dur=Math.round((ts-start)/60000);
-        if(dur>=5) naps.push({start,end:ts,durMin:dur}); start=null;
+        const durMin=Math.round((ts-start)/60000);
+        if(durMin>=MIN_NAP_MIN) naps.push({start,end:ts,durMin});
+        start=null;
       }
     }
-    if(start){const dur=Math.round((now-start)/60000);if(dur>=5)naps.push({start,end:now,durMin:dur,ongoing:true});}
+    if(start){
+      const durMin=Math.round((now-start)/60000);
+      if(durMin>=MIN_NAP_MIN) naps.push({start,end:now,durMin,ongoing:true});
+    }
     return naps;
   }
 
