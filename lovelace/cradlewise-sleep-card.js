@@ -1,7 +1,13 @@
 /**
- * Cradlewise Sleep Insights Card v19 — Month tab (real 30-day data), sleep-day (8am–8am) keying
+ * Cradlewise Sleep Insights Card v20 — perf: cached day-totals, lazy 62-day month fetch
  * Main: Day/Week/Month tabs (all functional)
  * Preview: week navigation ◀▶, C-shape tap-to-tooltip, List nap expand
+ *
+ * v20: week/month lag fix. v19 re-fetched 62 days (~15k rows) every 5 min and
+ * re-parsed ALL rows on EVERY render (one per HA state update) to derive daily
+ * totals. Now: the recurring fetch is 8 days; the per-day map is computed once
+ * per fetch and cached; the 62-day payload loads only when the Month tab is
+ * opened (or month data goes stale), throttled to 30 min.
  */
 
 const C = {
@@ -19,6 +25,9 @@ class CradlewiseSleepCard extends HTMLElement {
     this.attachShadow({mode:'open'});
     this._hass=null; this._config=null; this._history=null; this._historyErr=null;
     this._lastFetch=0; this._FETCH_INTERVAL=300_000;
+    // Month-tab history is a separate, much bigger (62-day) fetch — loaded lazily
+    // and throttled, so opening the card / Day tab never pulls it.
+    this._monthByDay=null; this._monthFetch=0; this._MONTH_FETCH_INTERVAL=1_800_000;
     // Main view state
     this._mainTab='day';  // 'day'|'week'|'month'
     // Preview state
@@ -279,28 +288,53 @@ class CradlewiseSleepCard extends HTMLElement {
     if(!this._hass||this._demo) return;
     const c=this._config;
     const dayStart=new Date(); dayStart.setHours(0,0,0,0);
-    const histStart=new Date(dayStart); histStart.setDate(histStart.getDate()-61);
+    // 8 days: the strip shows 7, and a 0–8am state belongs to the PREVIOUS
+    // sleep-day, so one extra day covers the overnight spill. Explicit end_time —
+    // without it the API returns only start+1day, which silently reduced the
+    // week strip to a single day.
+    const histStart=new Date(dayStart); histStart.setDate(histStart.getDate()-7);
     try {
-      // Day history is owned by _fetchDay; this feeds the week strip AND the
-      // month tab (62 days covers current + previous month). Explicit end_time —
-      // without it the API returns only start+1day, which silently reduced the
-      // week strip to a single day.
       const weekH=await this._hass.callApi('GET',
         `history/period/${histStart.toISOString()}?filter_entity_id=${this._pick(c.total_sleep)}`
         +`&end_time=${encodeURIComponent(new Date(dayStart.getTime()+86400000).toISOString())}`
         +`&minimal_response=true&no_attributes=true`);
-      this._history={weekArr:weekH?.[0]||[]};
+      const weekArr=weekH?.[0]||[];
+      // Derive the day map ONCE per fetch — renders must not iterate raw rows.
+      this._history={weekArr, byDay:this._byDayTotals(weekArr)};
       this._historyErr=null;
       this._render();
     } catch(e){
       // Recorder/history can be unavailable (DB down, history: not enabled).
       // Not fatal — the day timeline falls back to the integration's own
       // nap attributes, so only the week view actually needs history.
-      this._history={weekArr:[]};
+      this._history={weekArr:[], byDay:{}};
       this._historyErr=e;
       console.warn('[sleep-card] history unavailable, using live nap attributes',e);
       this._render();
     }
+  }
+
+  // 62-day fetch that feeds ONLY the month tab. Called from the render path —
+  // self-throttles, so repeated renders are free and only the first month-tab
+  // view (or a >30-min-stale one) actually hits the API.
+  _loadMonthHistory() {
+    if(!this._hass||this._demo) return;
+    const now=Date.now();
+    if(this._monthByDay && now-this._monthFetch<this._MONTH_FETCH_INTERVAL) return;
+    this._monthFetch=now;
+    const c=this._config;
+    const dayStart=new Date(); dayStart.setHours(0,0,0,0);
+    const histStart=new Date(dayStart); histStart.setDate(histStart.getDate()-61);
+    const url=`history/period/${histStart.toISOString()}?filter_entity_id=${this._pick(c.total_sleep)}`
+      +`&end_time=${encodeURIComponent(new Date(dayStart.getTime()+86400000).toISOString())}`
+      +`&minimal_response=true&no_attributes=true`;
+    this._hass.callApi('GET',url).then(h=>{
+      this._monthByDay=this._byDayTotals(h?.[0]||[]);
+      this._render();
+    }).catch(e=>{
+      // Month cells fall back to the week map (current month, recent days).
+      console.warn('[sleep-card] month history unavailable',e);
+    });
   }
 
   _render(){if(!this._hass||!this._config) return; this._demo?this._renderPreview():this._renderMain();}
@@ -329,7 +363,7 @@ class CradlewiseSleepCard extends HTMLElement {
     // Week bars data
     const weekBars=this._buildWeekBars();
     const maxBar=Math.max(...weekBars.map(b=>b.v),1);
-    const monthData=this._mainTab==='month'?this._buildMonthCells():null;
+    const monthData=this._mainTab==='month'?(this._loadMonthHistory(),this._buildMonthCells()):null;
 
     const barHtml=weekBars.map((b,i)=>{
       const pct=Math.round((b.v/maxBar)*100);
@@ -493,11 +527,11 @@ class CradlewiseSleepCard extends HTMLElement {
     return this._napTimeline();
   }
 
-  _byDayTotals(){
+  _byDayTotals(arr){
     // total-sleep history keyed by SLEEP-DAY start (8am–8am, the crib's day):
     // a state at 3am belongs to the sleep-day that started the prior morning.
     // Rows ascend, so the last write per sleep-day = that day's final total.
-    const arr=this._history?.weekArr||[];
+    // Pure function of the array — call once per fetch and cache the result.
     const byDay={};
     for(const e of arr){
       const d=new Date(e.last_changed||e.last_updated);
@@ -513,10 +547,9 @@ class CradlewiseSleepCard extends HTMLElement {
   _buildWeekBars(){
     const c=this._config;
     const today=new Date();
-    // Try to use live history
-    const arr=this._history?.weekArr||[];
-    if(arr.length>0){
-      const byDay=this._byDayTotals();
+    // Cached day map (computed once per fetch — never iterate raw rows here).
+    const byDay=this._history?.byDay;
+    if(byDay){
       const DAYS=[];
       for(let i=6;i>=0;i--){
         const d=new Date(today); d.setDate(d.getDate()-i);
@@ -542,7 +575,9 @@ class CradlewiseSleepCard extends HTMLElement {
 
   _buildMonthCells(){
     // Calendar grid for the visible month; cell values are sleep-day totals.
-    const byDay=this._byDayTotals();
+    // Prefer the cached 62-day month map; until it lands (or if it failed) fall
+    // back to the week map, which still covers the current month's recent days.
+    const byDay=this._monthByDay||this._history?.byDay||{};
     const today=new Date();
     const t0=new Date(today.getFullYear(),today.getMonth(),today.getDate());
     const mStart=new Date(today.getFullYear(), today.getMonth()+this._monthOffset, 1);
