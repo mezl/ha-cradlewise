@@ -1,8 +1,33 @@
-"""Cradlewise WebRTC video receiver — connects to crib's local MQTT/WebRTC."""
+"""Cradlewise WebRTC video receiver — crib LOCAL broker, firmware 5.80+ recipe.
+
+Rewritten 2026-10-24 after crib firmware 5.80 (updated 2026-10-22) changed AMS
+behavior. The old recipe (port-rewrite filter, SDP-embedded candidates,
+empty-candidate marker, 5s STUN gather) now hangs: AMS expires the pending
+session in ~1-2s, so the answer must go out in <100ms.
+
+Verified working 2026-10-24 01:31 & 01:40 (video frames flowing):
+1. NO STUN server: RTCPeerConnection(RTCConfiguration(iceServers=[])) — aiortc's
+   default Google-STUN srflx query burns a 5s gather timeout and AMS is gone by
+   then. Offer→sendResponse lands in ~15ms.
+2. Passive DTLS (unchanged from v1): AMS is a hardcoded DTLS client; patch
+   a=setup:active → a=setup:passive BEFORE setLocalDescription. (Answering
+   "active" like the app does gets ICE up but DTLS dies with an empty error
+   for non-app clients.)
+3. App-shaped answer SDP: strip ALL a=candidate: lines and a=end-of-candidates,
+   m-line ports → 9, keep c=IN IP4 0.0.0.0, single sha-256 fingerprint. Then
+   trickle ONLY the LAN host candidate via iceMsg (sdpMid "video0") — NO
+   empty-candidate marker.
+
+Two-way talk (CribTalkTrack) is NOT wired in this version: the 5.80 offer's
+audio m-line is bundle-only port-0 and only the recvonly answer shape is
+verified against the new AMS. Re-add after testing.
+
+Reference capture of a real app session: /tmp/app_session_capture.json (itx).
+Proof-of-concept holder: /tmp/ams_hold.py (itx, 2026-10-24).
+"""
 from __future__ import annotations
 
 import asyncio
-import fractions
 import json
 import logging
 import re
@@ -15,7 +40,11 @@ from typing import Callable
 import av
 import numpy as np
 import paho.mqtt.client as mqtt
-from aiortc import AudioStreamTrack, RTCPeerConnection, RTCSessionDescription
+from aiortc import (
+    RTCConfiguration,
+    RTCPeerConnection,
+    RTCSessionDescription,
+)
 from aiortc.sdp import candidate_from_sdp
 
 _LOGGER = logging.getLogger(__name__)
@@ -27,13 +56,13 @@ _CRADLE_ID = "29976d6e-4bbf-433c-bdf6-0ed6606e3fc5"
 _ROOM_TOPIC = f"/{_CRADLE_ID}/room"
 _APP_NAME = "live"
 
-# The crib's local MQTT broker whitelists this specific device ID.
-# The reconnect logic in _schedule_reconnect handles recovery when the phone
-# app temporarily takes over the stream.
-_CLIENT_ID = "05f8aa8c-7dce-4e3e-9063-5f9f1046956f"
-_STREAM_NAME = _CLIENT_ID
+# Seed-row identity (phone-tier cert, unused by any real client, so HA never
+# fights the app over the one-session-per-clientId rule). Certs for this id
+# must be installed as certs/client.pem + certs/client.key.
+# Stream name is the shared phone row the crib already streams to.
+_CLIENT_ID = "0c3c101d-29e5-4c45-9c90-843701c3362a"
+_STREAM_NAME = "dc281e34-2aa0-4ccd-92ea-2b35021cdf5e"
 
-# How long to wait before re-requesting a stream after it drops.
 _RECONNECT_DELAY = 8.0
 
 
@@ -47,52 +76,19 @@ def _get_local_ip_for_host(host: str) -> str:
             return ""
 
 
-def _filter_sdp_wifi_only(sdp: str, local_ip: str) -> tuple[str, int]:
-    """Keep only candidates reachable on the same subnet as the crib."""
-    lines = sdp.splitlines()
-    wifi_port: int | None = None
-    wifi_cands: list[str] = []
-
-    for line in lines:
-        if not line.startswith("a=candidate:"):
-            continue
-        parts = line.split()
-        if len(parts) < 8:
-            continue
-        cand_ip = parts[4]
-        cand_type = parts[7]
-        if cand_ip == local_ip and cand_type == "host":
-            wifi_port = int(parts[5])
-            wifi_cands.append(line)
-        elif cand_type == "srflx":
-            m = re.search(r"raddr (\S+)", line)
-            if m and m.group(1) == local_ip:
-                wifi_cands.append(line)
-
-    if not wifi_port:
-        _LOGGER.warning("filter_sdp: no candidate for %s — using unfiltered SDP", local_ip)
-        return sdp, 0
-
-    new_lines: list[str] = []
-    cands_added = False
-    for line in lines:
+def _strip_candidates_app_shape(sdp: str) -> str:
+    """App-shaped answer: no candidates, m-line ports 9 (candidates trickle)."""
+    out_lines: list[str] = []
+    for line in sdp.splitlines():
         if line.startswith("m="):
             parts = line.split()
-            parts[1] = str(wifi_port)
-            new_lines.append(" ".join(parts))
-            cands_added = False
-        elif line.startswith("c=IN IP4"):
-            new_lines.append(f"c=IN IP4 {local_ip}")
-        elif line.startswith("a=candidate:"):
-            pass
-        elif line.startswith("a=end-of-candidates"):
-            if not cands_added:
-                new_lines.extend(wifi_cands)
-                cands_added = True
-            new_lines.append(line)
+            parts[1] = "9"
+            out_lines.append(" ".join(parts))
+        elif line.startswith(("a=candidate:", "a=end-of-candidates")):
+            continue
         else:
-            new_lines.append(line)
-    return "\n".join(new_lines), wifi_port
+            out_lines.append(line)
+    return "\n".join(out_lines)
 
 
 def _make_ssl_ctx() -> ssl.SSLContext:
@@ -109,41 +105,6 @@ def _make_ssl_ctx() -> ssl.SSLContext:
     return ctx
 
 
-class CribTalkTrack(AudioStreamTrack):
-    """Outbound audio track — sends s16le 48 kHz stereo PCM to the crib."""
-
-    kind = "audio"
-    _RATE = 48000
-    _SAMPLES = 960           # 20 ms per frame
-    _FRAME_BYTES = _SAMPLES * 2 * 2  # stereo × s16
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
-
-    async def recv(self) -> av.AudioFrame:
-        pts, time_base = await self.next_timestamp()
-        try:
-            data = self._queue.get_nowait()
-        except asyncio.QueueEmpty:
-            data = bytes(self._FRAME_BYTES)  # silence
-        data = (data + bytes(self._FRAME_BYTES))[: self._FRAME_BYTES]
-        arr = np.frombuffer(data, dtype=np.int16).reshape(1, self._SAMPLES * 2)
-        frame = av.AudioFrame.from_ndarray(arr, format="s16", layout="stereo")
-        frame.sample_rate = self._RATE
-        frame.pts = pts
-        frame.time_base = time_base
-        return frame
-
-    def push_pcm(self, pcm: bytes) -> None:
-        """Chunk raw s16le stereo PCM into 20 ms frames and enqueue."""
-        for i in range(0, len(pcm), self._FRAME_BYTES):
-            try:
-                self._queue.put_nowait(pcm[i : i + self._FRAME_BYTES])
-            except asyncio.QueueFull:
-                pass  # slow consumer — drop
-
-
 class CradlewiseVideoReceiver:
     """Receives H264 video (and audio if offered) from the crib via WebRTC-over-MQTT."""
 
@@ -152,7 +113,6 @@ class CradlewiseVideoReceiver:
         self._audio_callback = audio_callback
         self._client: mqtt.Client | None = None
         self._pc: RTCPeerConnection | None = None
-        self._talk_track: CribTalkTrack | None = None
         self._session_id: str = ""
         self._loop: asyncio.AbstractEventLoop | None = None
         self._running = False
@@ -171,12 +131,17 @@ class CradlewiseVideoReceiver:
         if self._pc and self._loop:
             asyncio.run_coroutine_threadsafe(self._pc.close(), self._loop)
             self._pc = None
-        self._talk_track = None
 
     def push_audio(self, pcm: bytes) -> None:
-        """Push raw s16le stereo 48 kHz PCM to send to the crib."""
-        if self._talk_track is not None:
-            self._talk_track.push_pcm(pcm)
+        """Accept raw s16le stereo 48 kHz PCM for the crib speaker.
+
+        Two-way talk is disabled in this version: the 5.80 offer's audio
+        m-line is bundle-only port 0 and only the recvonly answer shape is
+        verified against the new AMS. Drop the PCM (no-op) until the talk
+        track is re-verified — matches v1's behavior when no talk track
+        was active. See module docstring.
+        """
+        _LOGGER.debug("push_audio dropped (talk disabled in 5.80 receiver)")
 
     # ── MQTT ────────────────────────────────────────────────────────────────
 
@@ -188,11 +153,6 @@ class CradlewiseVideoReceiver:
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect
         self._client = client
-        # keepalive raised 15s -> 60s: the crib's WiFi is jittery (in-room AP, 0% loss
-        # but latency spikes), and a 15s keepalive tore down the whole WebRTC session
-        # after only ~22s of silence, turning brief blips into ~2.5min recovery stalls.
-        # 60s lets the session ride out short blips; genuine stalls are still caught by
-        # the frigate-fps `crib_stall_auto_recover` automation.
         client.connect_async(_HOST, _PORT, keepalive=60)
         client.loop_start()
 
@@ -224,7 +184,6 @@ class CradlewiseVideoReceiver:
 
     def _on_disconnect(self, client, userdata, disconnect_flags, rc, props=None) -> None:
         _LOGGER.warning("Local MQTT disconnected rc=%s", rc)
-        # paho-mqtt auto-reconnects; on_connect will re-send getOffer.
         if self._running and self._loop:
             asyncio.run_coroutine_threadsafe(self._reset_peer_connection(), self._loop)
 
@@ -245,10 +204,8 @@ class CradlewiseVideoReceiver:
         if self._pc:
             await self._pc.close()
             self._pc = None
-        self._talk_track = None
 
     async def _schedule_reconnect(self) -> None:
-        """Wait, then re-request a stream offer from AMS."""
         _LOGGER.info("WebRTC session ended — reconnecting in %.0fs", _RECONNECT_DELAY)
         await asyncio.sleep(_RECONNECT_DELAY)
         if not self._running:
@@ -264,12 +221,9 @@ class CradlewiseVideoReceiver:
             stream_info = data.get("streamInfo", {})
             self._session_id = stream_info.get("sessionId", self._session_id)
 
-            pc = RTCPeerConnection()
+            # NO STUN: default Google-STUN costs a 5s gather; AMS is long gone.
+            pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
             self._pc = pc
-
-            # Add outbound audio track before negotiation so it appears in the answer SDP.
-            self._talk_track = CribTalkTrack()
-            pc.addTrack(self._talk_track)
 
             @pc.on("track")
             def on_track(track):
@@ -291,23 +245,26 @@ class CradlewiseVideoReceiver:
             )
 
             answer = await pc.createAnswer()
-
-            # AMS is hardcoded as DTLS client; we must be passive (server).
-            passive_sdp = answer.sdp.replace("a=setup:active", "a=setup:passive")
+            # AMS is a hardcoded DTLS client → we must answer passive (server).
+            answer = RTCSessionDescription(
+                sdp=answer.sdp.replace("a=setup:active", "a=setup:passive"),
+                type=answer.type,
+            )
+            # App shape: candidates stripped, m-ports 9; they trickle instead.
             await pc.setLocalDescription(
-                RTCSessionDescription(sdp=passive_sdp, type=answer.type)
+                RTCSessionDescription(
+                    sdp=_strip_candidates_app_shape(answer.sdp), type=answer.type
+                )
             )
 
             local_ip = _get_local_ip_for_host(_HOST)
-            full_sdp = pc.localDescription.sdp
-            filtered_sdp, wifi_port = _filter_sdp_wifi_only(full_sdp, local_ip)
-            if not wifi_port:
-                filtered_sdp = full_sdp
-
             self._publish({
                 "command": "sendResponse",
                 "direction": "play",
-                "sdp": {"sdp": filtered_sdp, "type": pc.localDescription.type},
+                "sdp": {
+                    "sdp": _strip_candidates_app_shape(pc.localDescription.sdp),
+                    "type": pc.localDescription.type,
+                },
                 "streamInfo": {
                     "applicationName": _APP_NAME,
                     "sessionId": self._session_id,
@@ -315,10 +272,12 @@ class CradlewiseVideoReceiver:
                 },
                 "userData": {"param1": "value1"},
             })
+            _LOGGER.debug("Sent sendResponse (session=%s)", self._session_id)
 
-            # AMS ignores SDP-embedded candidates — send via trickle iceMsg.
-            if wifi_port and local_ip:
-                for line in full_sdp.splitlines():
+            # Trickle ONLY the routable LAN host candidate, like the app.
+            # No empty-candidate marker in the 5.80 flow.
+            if local_ip:
+                for line in pc.localDescription.sdp.splitlines():
                     if not line.startswith("a=candidate:"):
                         continue
                     parts = line.split()
@@ -326,19 +285,6 @@ class CradlewiseVideoReceiver:
                         self._publish({
                             "iceMsg": {
                                 "candidate": line[2:],
-                                "sdpMLineIndex": 0,
-                                "sdpMid": "video0",
-                            },
-                            "streamInfo": {
-                                "applicationName": _APP_NAME,
-                                "sessionId": self._session_id,
-                                "streamName": _STREAM_NAME,
-                            },
-                        })
-                        await asyncio.sleep(0.1)
-                        self._publish({
-                            "iceMsg": {
-                                "candidate": "",
                                 "sdpMLineIndex": 0,
                                 "sdpMid": "video0",
                             },
@@ -381,7 +327,7 @@ class CradlewiseVideoReceiver:
                 break
 
     async def _receive_audio(self, track) -> None:
-        _LOGGER.info("Audio stream started (format will be logged on first frame)")
+        _LOGGER.info("Audio stream started")
         first = True
         while True:
             try:
