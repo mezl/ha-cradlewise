@@ -1,5 +1,16 @@
 # Sleep-Insights Card — Week/Month Lag Handoff (2026-10-24)
 
+> ## ✅ RESOLVED 2026-10-24 — card v21, resource `?v=31`
+> Root cause = hypothesis #2, measured on the REAL dashboard (headless Chromium logged in with the HA token):
+> `set hass` fired 13–18×/s and every call rebuilt the whole shadow DOM, so a tap landing between press and
+> release hit a destroyed element — **only 1 of 20 slow (150 ms) taps registered**.
+> Fix: `set hass` re-renders only when one of the card's own entity state objects changed (reference compare),
+> renders are coalesced to one per animation frame (`_scheduleRender`), a render waits while a pointer is down
+> (max 1.5 s), and a 60 s tick keeps time-based bits fresh. After: 0–1 full renders per 20 s idle, **20/20 taps**.
+> Footer now shows `v21 (r31)` so the running version is visible. `?v=` bumped via websocket
+> `lovelace/resources/update` (no core restart needed). The isolated bench missed it because it measured render
+> COST, not render FREQUENCY × interaction.
+
 > Handoff doc for an AI agent to fix the "week and month is very lag" problem.
 > Everything verified today is in here with numbers. Read fully before editing.
 

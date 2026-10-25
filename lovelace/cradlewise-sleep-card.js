@@ -1,5 +1,6 @@
 /**
- * Cradlewise Sleep Insights Card v20 — perf: cached day-totals, lazy 62-day month fetch
+ * Cradlewise Sleep Insights Card v21 — perf: render only when the card's own entities change
+ * (v20: cached day-totals, lazy 62-day month fetch)
  * Main: Day/Week/Month tabs (all functional)
  * Preview: week navigation ◀▶, C-shape tap-to-tooltip, List nap expand
  *
@@ -8,7 +9,16 @@
  * totals. Now: the recurring fetch is 8 days; the per-day map is computed once
  * per fetch and cached; the 62-day payload loads only when the Month tab is
  * opened (or month data goes stale), throttled to 30 min.
+ *
+ * v21: the actual lag. HA calls `set hass` for EVERY state change in the house
+ * (measured 13-18/s on this install) and each call rebuilt the whole shadow DOM,
+ * so a tap landing between press and release hit a destroyed element — only
+ * 1 of 20 slow taps registered. Now `set hass` re-renders only when one of the
+ * card's own entities changed, renders are coalesced to one per frame, and a
+ * render waits while a pointer is down.
  */
+
+const CARD_VERSION='v21 (r31)';
 
 const C = {
   sleep:'#251462', stirring:'#504aa4', awake:'#f9a12d',
@@ -42,6 +52,15 @@ class CradlewiseSleepCard extends HTMLElement {
     this._showMonthPicker=false;
     this._pickYear=new Date().getFullYear();
     this._resizeObserver=null;
+    // Render scheduling (see v21 note at top).
+    this._watchStates=null;   // last-rendered state objects of the card's entities
+    this._renderPending=false;
+    this._ptrDown=0;          // timestamp of an unreleased pointerdown, or 0
+    this.shadowRoot.addEventListener('pointerdown',()=>{this._ptrDown=Date.now();});
+    const release=()=>{this._ptrDown=0; if(this._renderPending){this._renderPending=false;this._scheduleRender();}};
+    this.shadowRoot.addEventListener('pointerup',release);
+    this.shadowRoot.addEventListener('pointercancel',release);
+    this.shadowRoot.addEventListener('pointerleave',release);
   }
 
   setConfig(cfg) {
@@ -59,6 +78,37 @@ class CradlewiseSleepCard extends HTMLElement {
       longest_nap:cfg.longest_nap||['sensor.cradlewise_avo_longest_nap_today','sensor.cradlewise_avo_longest_nap'],
       crib_soothing:cfg.crib_soothing||['binary_sensor.cradlewise_avo_crib_soothing'],
     };
+    // Every entity id the card can read (all candidates, so a fallback that
+    // comes back to life still triggers a render).
+    const {name,...ents}=this._config;
+    this._watchIds=[...new Set(Object.values(ents).flat())];
+    this._watchStates=null;
+  }
+
+  // True when any watched entity's state object changed since the last check.
+  // HA replaces a state object whenever its state or attributes change, so a
+  // reference compare is exact and costs ~10 lookups.
+  _statesChanged(hass){
+    const cur=(this._watchIds||[]).map(id=>hass.states[id]);
+    const prev=this._watchStates;
+    this._watchStates=cur;
+    return !prev||cur.length!==prev.length||cur.some((st,i)=>st!==prev[i]);
+  }
+
+  // One render per animation frame at most; held while a pointer is down so a
+  // press is never split across a DOM rebuild (held max 1.5 s, in case the
+  // release happened outside the card).
+  _scheduleRender(){
+    if(this._renderPending) return;
+    this._renderPending=true;
+    requestAnimationFrame(()=>{
+      if(this._ptrDown&&Date.now()-this._ptrDown<1500){
+        setTimeout(()=>{this._renderPending=false;this._scheduleRender();},100);
+        return;
+      }
+      this._renderPending=false;
+      this._render();
+    });
   }
 
   // Entity ids may be a single id (from user config) or a list of candidates.
@@ -116,11 +166,11 @@ class CradlewiseSleepCard extends HTMLElement {
       if(totalsRes) entry.totals=this._peakTotals(totalsRes,totalIds);
       entry.loading=false; entry.at=Date.now();
       if(isToday) this._backfillToday(entry,dayStart);
-      this._render();
+      this._scheduleRender();
     }).catch(e=>{
       entry.loading=false; entry.error=e; entry.at=Date.now();
       if(isToday){const fb=this._napTimeline(); entry.phase=fb.phase; entry.soothing=fb.soothing;}
-      this._render();
+      this._scheduleRender();
     });
     return entry;
   }
@@ -281,7 +331,7 @@ class CradlewiseSleepCard extends HTMLElement {
     if(!this._demo && now-this._lastFetch>this._FETCH_INTERVAL){
       this._lastFetch=now; this._loadHistory();
     }
-    this._render();
+    if(this._statesChanged(hass)) this._scheduleRender();
   }
 
   async _loadHistory() {
@@ -302,7 +352,7 @@ class CradlewiseSleepCard extends HTMLElement {
       // Derive the day map ONCE per fetch — renders must not iterate raw rows.
       this._history={weekArr, byDay:this._byDayTotals(weekArr)};
       this._historyErr=null;
-      this._render();
+      this._scheduleRender();
     } catch(e){
       // Recorder/history can be unavailable (DB down, history: not enabled).
       // Not fatal — the day timeline falls back to the integration's own
@@ -310,7 +360,7 @@ class CradlewiseSleepCard extends HTMLElement {
       this._history={weekArr:[], byDay:{}};
       this._historyErr=e;
       console.warn('[sleep-card] history unavailable, using live nap attributes',e);
-      this._render();
+      this._scheduleRender();
     }
   }
 
@@ -330,7 +380,7 @@ class CradlewiseSleepCard extends HTMLElement {
       +`&minimal_response=true&no_attributes=true`;
     this._hass.callApi('GET',url).then(h=>{
       this._monthByDay=this._byDayTotals(h?.[0]||[]);
-      this._render();
+      this._scheduleRender();
     }).catch(e=>{
       // Month cells fall back to the week map (current month, recent days).
       console.warn('[sleep-card] month history unavailable',e);
@@ -423,6 +473,7 @@ class CradlewiseSleepCard extends HTMLElement {
       .mdn{font-size:11px;color:${C.textGray};font-weight:600}
       .mval{font-size:11px;font-weight:700;color:#7b6ed6;margin-top:3px}
       .mnote{text-align:center;font-size:11px;color:#bbb;margin-top:10px}
+      .ver{text-align:right;font-size:9px;color:#c8c2b8;margin-top:12px}
     </style>
     <div class="outer">
       <div class="hdr">
@@ -477,6 +528,7 @@ class CradlewiseSleepCard extends HTMLElement {
         </div>
         <div class="mnote">Each day = total sleep 8 AM → 8 AM (the crib's sleep-day). ◀ shows the previous month.</div>
       `:''}
+      <div class="ver">${CARD_VERSION}</div>
     </div>`;
 
     this.shadowRoot.getElementById('t-day').addEventListener('click',()=>{this._mainTab='day';this._render();});
@@ -1184,7 +1236,16 @@ class CradlewiseSleepCard extends HTMLElement {
     return{segments:segs,sleepMin,stirringMin,soothed};
   }
 
-  disconnectedCallback(){if(this._resizeObserver){this._resizeObserver.disconnect();this._resizeObserver=null;}}
+  connectedCallback(){
+    // Renders no longer ride on every hass update, so tick once a minute to keep
+    // time-based bits (now-marker, day rollover) fresh.
+    if(!this._tick) this._tick=setInterval(()=>this._scheduleRender(),60_000);
+    if(this._hass) this._scheduleRender();
+  }
+  disconnectedCallback(){
+    if(this._tick){clearInterval(this._tick);this._tick=null;}
+    if(this._resizeObserver){this._resizeObserver.disconnect();this._resizeObserver=null;}
+  }
 
   static getStubConfig(){return{name:'Avo'};}
 }
