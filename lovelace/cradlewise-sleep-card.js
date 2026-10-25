@@ -22,7 +22,7 @@
  * (cached), so navigation is no longer limited to the last 8/62 days.
  */
 
-const CARD_VERSION='v22 (r32)';
+const CARD_VERSION='v23 (r33)';
 
 const C = {
   sleep:'#251462', stirring:'#504aa4', awake:'#f9a12d',
@@ -933,8 +933,10 @@ class CradlewiseSleepCard extends HTMLElement {
           e.preventDefault();
           const rect=canvas.getBoundingClientRect();
           const dpr=window.devicePixelRatio||1;
-          const cx2=(e.touches?e.touches[0].clientX:e.clientX)-rect.left;
-          const cy2=(e.touches?e.touches[0].clientY:e.clientY)-rect.top;
+          // touchend has an EMPTY e.touches; the lifted finger is in changedTouches.
+          const pt=e.changedTouches?.[0]||e.touches?.[0]||e;
+          const cx2=pt.clientX-rect.left;
+          const cy2=pt.clientY-rect.top;
           // Scale to canvas logical coords
           const lx=cx2*(canvas.width/dpr)/rect.width;
           const ly=cy2*(canvas.height/dpr)/rect.height;

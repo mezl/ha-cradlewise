@@ -178,6 +178,10 @@ class CradlewiseCameraEntity(Camera):
     _attr_unique_id = f"{CRADLE_ID}_camera"
     _attr_device_info = _DEVICE_INFO
     _attr_is_streaming = True
+    # HA's "live" view (and camera_proxy_stream) re-sends async_camera_image()
+    # every frame_interval; the default 0.5 s capped the crib view at 2 fps even
+    # though WebRTC delivers ~10 fps. Unchanged frames are not re-sent.
+    _attr_frame_interval = 0.1
     _attr_icon = "mdi:cctv"
 
     def __init__(self, hass: HomeAssistant) -> None:
