@@ -16,9 +16,13 @@
  * 1 of 20 slow taps registered. Now `set hass` re-renders only when one of the
  * card's own entities changed, renders are coalesced to one per frame, and a
  * render waits while a pointer is down.
+ *
+ * v22: Week tab gets ◀ ▶ week navigation; tapping a week bar or a month-calendar
+ * day opens that day's detail chart. Past weeks/months load per calendar month
+ * (cached), so navigation is no longer limited to the last 8/62 days.
  */
 
-const CARD_VERSION='v21 (r31)';
+const CARD_VERSION='v22 (r32)';
 
 const C = {
   sleep:'#251462', stirring:'#504aa4', awake:'#f9a12d',
@@ -45,6 +49,8 @@ class CradlewiseSleepCard extends HTMLElement {
     this._chartTab='chart'; // 'chart'|'list'
     this._weekOffset=0;    // 0=current week, -1=prev week, etc.
     this._monthOffset=0;   // 0=current month, -1=prev month (month tab)
+    this._mainWeekOffset=0; // 0=week ending today, -1=the 7 days before (week tab)
+    this._monthCache={};   // 'y-m' -> {loading, at, byDay} sleep-day totals per calendar month
     this._selectedDayIdx=6; // within the current week strip
     this._expandedNapIdx=null;
     this._cTooltip=null;   // {t, timeStr, stateLabel, col} or null
@@ -364,27 +370,54 @@ class CradlewiseSleepCard extends HTMLElement {
     }
   }
 
-  // 62-day fetch that feeds ONLY the month tab. Called from the render path —
-  // self-throttles, so repeated renders are free and only the first month-tab
-  // view (or a >30-min-stale one) actually hits the API.
-  _loadMonthHistory() {
-    if(!this._hass||this._demo) return;
-    const now=Date.now();
-    if(this._monthByDay && now-this._monthFetch<this._MONTH_FETCH_INTERVAL) return;
-    this._monthFetch=now;
-    const c=this._config;
-    const dayStart=new Date(); dayStart.setHours(0,0,0,0);
-    const histStart=new Date(dayStart); histStart.setDate(histStart.getDate()-61);
-    const url=`history/period/${histStart.toISOString()}?filter_entity_id=${this._pick(c.total_sleep)}`
-      +`&end_time=${encodeURIComponent(new Date(dayStart.getTime()+86400000).toISOString())}`
+  // Sleep-day totals for one calendar month, fetched lazily and cached.
+  // Window = [1st 08:00, next 1st 08:00): exactly that month's sleep-days.
+  // Past months never change; the current month refreshes every 30 min
+  // (today itself comes from the 8-day week fetch, refreshed every 5 min).
+  _monthTotals(y,m){
+    const key=`${y}-${m}`;
+    const hit=this._monthCache[key];
+    const now=new Date();
+    const isCur=y===now.getFullYear()&&m===now.getMonth();
+    if(hit&&(hit.loading||!isCur||Date.now()-hit.at<this._MONTH_FETCH_INTERVAL)) return hit.byDay;
+    if(!this._hass||this._demo) return hit?.byDay||{};
+    const entry=this._monthCache[key]={loading:true,at:Date.now(),byDay:hit?.byDay||{}};
+    const start=new Date(y,m,1,8), end=new Date(y,m+1,1,8);
+    if(start>now){entry.loading=false; return entry.byDay;}
+    const url=`history/period/${start.toISOString()}?filter_entity_id=${this._pick(this._config.total_sleep)}`
+      +`&end_time=${encodeURIComponent((end<now?end:now).toISOString())}`
       +`&minimal_response=true&no_attributes=true`;
     this._hass.callApi('GET',url).then(h=>{
-      this._monthByDay=this._byDayTotals(h?.[0]||[]);
+      entry.byDay=this._byDayTotals(h?.[0]||[]); entry.loading=false; entry.at=Date.now();
       this._scheduleRender();
     }).catch(e=>{
-      // Month cells fall back to the week map (current month, recent days).
-      console.warn('[sleep-card] month history unavailable',e);
+      entry.loading=false; entry.at=Date.now();
+      console.warn('[sleep-card] month history unavailable',key,e);
     });
+    return entry.byDay;
+  }
+
+  // Sleep-day total for a date: live week map first (freshest), else month cache.
+  _dayTotal(d){
+    const k=`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    const w=this._history?.byDay?.[k];
+    if(w!=null) return w;
+    return this._monthTotals(d.getFullYear(),d.getMonth())[k];
+  }
+
+  // Open the detail view (C-chart) on a given date.
+  _openDay(date){
+    const today=new Date(); today.setHours(0,0,0,0);
+    const d=new Date(date); d.setHours(0,0,0,0);
+    const diffDays=Math.round((d-today)/86400000);
+    if(diffDays>0) return;
+    const weekOffset=Math.floor((diffDays+6)/7);
+    if(weekOffset<-104) return;
+    this._weekOffset=weekOffset;
+    this._selectedDayIdx=diffDays+6-weekOffset*7;
+    this._showMonthPicker=false; this._cTooltip=null; this._expandedNapIdx=null;
+    this._demo=true;
+    this._render();
   }
 
   _render(){if(!this._hass||!this._config) return; this._demo?this._renderPreview():this._renderMain();}
@@ -413,23 +446,25 @@ class CradlewiseSleepCard extends HTMLElement {
     // Week bars data
     const weekBars=this._buildWeekBars();
     const maxBar=Math.max(...weekBars.map(b=>b.v),1);
-    const monthData=this._mainTab==='month'?(this._loadMonthHistory(),this._buildMonthCells()):null;
+    const monthData=this._mainTab==='month'?this._buildMonthCells():null;
 
     const barHtml=weekBars.map((b,i)=>{
       const pct=Math.round((b.v/maxBar)*100);
       const h2=b.v>0?Math.max(pct,4):0;
-      const isSel=this._selectedBarIdx===i;
-      const col=isSel?'#a090ff':(b.isToday?'#7b6ed6':'#251462');
-      const vc=isSel?'#fff':(b.isToday?'#b2abd1':'#4a4a6e');
-      return `<div class="bc" data-action="bar" data-bi="${i}" role="button" tabindex="0">
+      const col=b.isToday?'#7b6ed6':'#251462';
+      const vc=b.isToday?'#7b6ed6':'#4a4a6e';
+      return `<div class="bc" data-action="bar" data-bi="${i}" role="button" tabindex="0" title="Open this day">
         <div class="bv" style="color:${vc}">${b.v>0?this._fm(b.v):''}</div>
-        <div class="bb" style="height:${h2}%;background:${col};box-shadow:${isSel?'0 0 8px rgba(160,144,255,.6)':'none'}"></div>
-        <div class="bl" style="color:${vc}">${b.label}</div>
+        <div class="bb" style="height:${h2}%;background:${col}"></div>
+        <div class="bl" style="color:${vc}">${b.label}<br>${b.dn}</div>
       </div>`;
     }).join('');
 
     const isDay=this._mainTab==='day';
     const isWeek=this._mainTab==='week';
+    const wFmt=d=>d.toLocaleDateString([],{month:'short',day:'numeric'});
+    const weekTitle=this._mainWeekOffset===0?'This week'
+      :`${wFmt(weekBars[0].date)} – ${wFmt(weekBars[6].date)}`;
 
     this.shadowRoot.innerHTML=`<style>
       :host{display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
@@ -470,6 +505,8 @@ class CradlewiseSleepCard extends HTMLElement {
       .mcell{background:rgba(37,20,98,0.05);border-radius:10px;padding:6px 2px;text-align:center;min-height:52px}
       .mcell.mtod{background:rgba(37,20,98,0.13);outline:2px solid #7b6ed6}
       .mcell.mfuture{opacity:.35}
+      .mcell[data-action]{cursor:pointer}
+      .mcell[data-action]:active,.bc:active{opacity:.6}
       .mdn{font-size:11px;color:${C.textGray};font-weight:600}
       .mval{font-size:11px;font-weight:700;color:#7b6ed6;margin-top:3px}
       .mnote{text-align:center;font-size:11px;color:#bbb;margin-top:10px}
@@ -505,11 +542,14 @@ class CradlewiseSleepCard extends HTMLElement {
         <button class="pbtn" id="pbtn">Sleep chart &amp; history</button>
       `:''}
       ${isWeek?`
+        <div class="mnav">
+          <button class="mnavb" data-action="wnav" data-d="-1" ${this._mainWeekOffset<=-104?'disabled':''}>◀</button>
+          <div class="mnavt">${weekTitle}</div>
+          <button class="mnavb" data-action="wnav" data-d="1" ${this._mainWeekOffset>=0?'disabled':''}>▶</button>
+        </div>
         <div class="week-wrap">
           <div class="wbars">${barHtml}</div>
-          ${(this._history?.weekArr||[]).length===0?`
-            <div class="wnote">No recorder history — showing today only.</div>
-          `:''}
+          <div class="wnote">${weekBars.some(b=>b.v>0)?'Tap a day to open its sleep chart.':'No recorded sleep for this week.'}</div>
         </div>
       `:''}
       ${monthData?`
@@ -521,12 +561,12 @@ class CradlewiseSleepCard extends HTMLElement {
         <div class="mgrid">
           ${['S','M','T','W','T','F','S'].map(l=>`<div class="mhead">${l}</div>`).join('')}
           ${monthData.cells.map(cl=> cl===null?'<div class="mcell"></div>':`
-            <div class="mcell${cl.isToday?' mtod':''}${cl.fut?' mfuture':''}">
+            <div class="mcell${cl.isToday?' mtod':''}${cl.fut?' mfuture':''}"${cl.fut?'':` data-action="mday" data-iso="${cl.iso}" role="button" tabindex="0"`}>
               <div class="mdn">${cl.n}</div>
               <div class="mval">${(!cl.fut&&cl.v>0)?this._fm(cl.v):''}</div>
             </div>`).join('')}
         </div>
-        <div class="mnote">Each day = total sleep 8 AM → 8 AM (the crib's sleep-day). ◀ shows the previous month.</div>
+        <div class="mnote">Each day = total sleep 8 AM → 8 AM (the crib's sleep-day). Tap a day to open its sleep chart.</div>
       `:''}
       <div class="ver">${CARD_VERSION}</div>
     </div>`;
@@ -542,11 +582,17 @@ class CradlewiseSleepCard extends HTMLElement {
     }));
     this.shadowRoot.getElementById('pbtn')?.addEventListener('click',()=>{this._demo=true;this._weekOffset=0;this._selectedDayIdx=6;this._render();});
 
-    // Week bar clicks
-    this.shadowRoot.querySelectorAll('[data-action="bar"]').forEach(el=>el.addEventListener('click',()=>{
-      const i=parseInt(el.dataset.bi);
-      this._selectedBarIdx=this._selectedBarIdx===i?null:i;
+    this.shadowRoot.querySelectorAll('[data-action="wnav"]').forEach(el=>el.addEventListener('click',()=>{
+      if(el.disabled) return;
+      this._mainWeekOffset=Math.min(0,Math.max(-104,this._mainWeekOffset+(parseInt(el.dataset.d)||0)));
       this._render();
+    }));
+    // Week bar / month day → that day's detail chart
+    this.shadowRoot.querySelectorAll('[data-action="bar"]').forEach(el=>el.addEventListener('click',()=>{
+      const b=weekBars[parseInt(el.dataset.bi)]; if(b) this._openDay(b.date);
+    }));
+    this.shadowRoot.querySelectorAll('[data-action="mday"]').forEach(el=>el.addEventListener('click',()=>{
+      const [y,m,d]=el.dataset.iso.split('-').map(Number); this._openDay(new Date(y,m-1,d));
     }));
 
     // Draw live C-shape
@@ -598,29 +644,16 @@ class CradlewiseSleepCard extends HTMLElement {
 
   _buildWeekBars(){
     const c=this._config;
-    const today=new Date();
-    // Cached day map (computed once per fetch — never iterate raw rows here).
-    const byDay=this._history?.byDay;
-    if(byDay){
-      const DAYS=[];
-      for(let i=6;i>=0;i--){
-        const d=new Date(today); d.setDate(d.getDate()-i);
-        const k=`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
-        DAYS.push({label:d.toLocaleDateString([],{weekday:'short'}).slice(0,2),v:byDay[k]||0,isToday:i===0});
-      }
-      if(DAYS.some(b=>b.v>0)) return DAYS;
-    }
-    // No recorder history. Show today's real total from the live sensor and
-    // leave the other days empty — never invent numbers, they read as real.
-    const todayVal=parseFloat(this._st(c.total_sleep));
+    const today=new Date(); today.setHours(0,0,0,0);
+    const off=this._mainWeekOffset;
     const DAYS=[];
     for(let i=6;i>=0;i--){
-      const d=new Date(today); d.setDate(d.getDate()-i);
-      DAYS.push({
-        label:d.toLocaleDateString([],{weekday:'short'}).slice(0,2),
-        v:(i===0&&!isNaN(todayVal))?todayVal:0,
-        isToday:i===0,
-      });
+      const d=new Date(today); d.setDate(d.getDate()-i+off*7);
+      let v=this._dayTotal(d);
+      // Today with no recorder row yet: the live sensor IS today's total.
+      if(off===0&&i===0&&v==null){const t=parseFloat(this._st(c.total_sleep)); if(!isNaN(t)) v=t;}
+      DAYS.push({date:d,label:d.toLocaleDateString([],{weekday:'short'}).slice(0,2),
+        dn:d.getDate(),v:v||0,isToday:off===0&&i===0});
     }
     return DAYS;
   }
@@ -629,7 +662,6 @@ class CradlewiseSleepCard extends HTMLElement {
     // Calendar grid for the visible month; cell values are sleep-day totals.
     // Prefer the cached 62-day month map; until it lands (or if it failed) fall
     // back to the week map, which still covers the current month's recent days.
-    const byDay=this._monthByDay||this._history?.byDay||{};
     const today=new Date();
     const t0=new Date(today.getFullYear(),today.getMonth(),today.getDate());
     const mStart=new Date(today.getFullYear(), today.getMonth()+this._monthOffset, 1);
@@ -639,9 +671,9 @@ class CradlewiseSleepCard extends HTMLElement {
     for(let i=0;i<firstDow;i++) cells.push(null);
     for(let dn=1; dn<=dim; dn++){
       const d=new Date(mStart.getFullYear(), mStart.getMonth(), dn);
-      const k=`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
       const isToday=d.getTime()===t0.getTime();
-      cells.push({n:dn, v:byDay[k], fut:d.getTime()>t0.getTime(), isToday});
+      const fut=d.getTime()>t0.getTime();
+      cells.push({n:dn, v:fut?null:this._dayTotal(d), fut, isToday, iso:`${d.getFullYear()}-${d.getMonth()+1}-${dn}`});
     }
     return {mStart, cells};
   }
