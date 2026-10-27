@@ -64,6 +64,12 @@ _CLIENT_ID = "0c3c101d-29e5-4c45-9c90-843701c3362a"
 _STREAM_NAME = "dc281e34-2aa0-4ccd-92ea-2b35021cdf5e"
 
 _RECONNECT_DELAY = 8.0
+# Watchdog: no decoded video frame for this long (and no offer request in that
+# window either) → tear down and request a fresh session. Backs off on repeated
+# stalls so an unresponsive crib is not hammered.
+_STALL_TIMEOUT = 20.0
+_STALL_TIMEOUT_MAX = 120.0
+_WATCHDOG_INTERVAL = 5.0
 
 
 def _get_local_ip_for_host(host: str) -> str:
@@ -116,14 +122,24 @@ class CradlewiseVideoReceiver:
         self._session_id: str = ""
         self._loop: asyncio.AbstractEventLoop | None = None
         self._running = False
+        self._reconnect_pending = False
+        self._last_frame = 0.0      # monotonic time of the last decoded video frame
+        self._last_request = 0.0    # monotonic time of the last getOffer
+        self._stalls = 0            # consecutive watchdog recoveries (backoff)
+        self._watchdog = None
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
         self._running = True
+        self._last_request = time.monotonic()
         self._connect_mqtt()
+        self._watchdog = asyncio.run_coroutine_threadsafe(self._watchdog_loop(), loop)
 
     def stop(self) -> None:
         self._running = False
+        if self._watchdog:
+            self._watchdog.cancel()
+            self._watchdog = None
         if self._client:
             self._client.loop_stop()
             self._client.disconnect()
@@ -162,6 +178,7 @@ class CradlewiseVideoReceiver:
 
     def _request_offer(self) -> None:
         self._session_id = str(int(time.time() * 1000))
+        self._last_request = time.monotonic()
         self._publish({
             "command": "getOffer",
             "direction": "play",
@@ -201,17 +218,48 @@ class CradlewiseVideoReceiver:
     # ── WebRTC ───────────────────────────────────────────────────────────────
 
     async def _reset_peer_connection(self) -> None:
-        if self._pc:
-            await self._pc.close()
-            self._pc = None
+        # Detach BEFORE closing: the old pc's "closed" event must see that it is
+        # no longer current, or it schedules a reconnect that kills the NEXT
+        # session (the old self-sustaining 8 s reconnect loop).
+        pc, self._pc = self._pc, None
+        if pc:
+            await pc.close()
 
     async def _schedule_reconnect(self) -> None:
-        _LOGGER.info("WebRTC session ended — reconnecting in %.0fs", _RECONNECT_DELAY)
-        await asyncio.sleep(_RECONNECT_DELAY)
-        if not self._running:
+        if self._reconnect_pending:
             return
-        await self._reset_peer_connection()
-        self._request_offer()
+        self._reconnect_pending = True
+        try:
+            _LOGGER.info("WebRTC session ended — reconnecting in %.0fs", _RECONNECT_DELAY)
+            await asyncio.sleep(_RECONNECT_DELAY)
+            if not self._running:
+                return
+            await self._reset_peer_connection()
+            self._request_offer()
+        finally:
+            self._reconnect_pending = False
+
+    async def _watchdog_loop(self) -> None:
+        """Recover from silent stalls: offer never answered, or frames stopped
+        without the connection reporting failed (both seen in the field)."""
+        while self._running:
+            await asyncio.sleep(_WATCHDOG_INTERVAL)
+            if not self._running or self._reconnect_pending:
+                continue
+            limit = min(_STALL_TIMEOUT * (2 ** self._stalls), _STALL_TIMEOUT_MAX)
+            now = time.monotonic()
+            if now - max(self._last_frame, self._last_request) < limit:
+                continue
+            self._stalls += 1
+            _LOGGER.warning(
+                "No crib video for %.0fs — requesting a new WebRTC session (stall #%d)",
+                now - self._last_frame if self._last_frame else -1, self._stalls,
+            )
+            try:
+                await self._reset_peer_connection()
+            except Exception:
+                _LOGGER.debug("reset during watchdog failed", exc_info=True)
+            self._request_offer()
 
     async def _handle_offer(self, data: dict) -> None:
         try:
@@ -237,6 +285,8 @@ class CradlewiseVideoReceiver:
             async def on_state():
                 state = pc.connectionState
                 _LOGGER.debug("WebRTC state: %s", state)
+                if pc is not self._pc:
+                    return  # a replaced session closing — expected, not a failure
                 if state in ("failed", "closed") and self._running:
                     asyncio.ensure_future(self._schedule_reconnect())
 
@@ -296,7 +346,7 @@ class CradlewiseVideoReceiver:
                         })
                         break
 
-            asyncio.ensure_future(self._keepalive_loop())
+            asyncio.ensure_future(self._keepalive_loop(pc))
 
         except Exception:
             _LOGGER.exception("_handle_offer failed")
@@ -321,6 +371,8 @@ class CradlewiseVideoReceiver:
         while True:
             try:
                 frame = await track.recv()
+                self._last_frame = time.monotonic()
+                self._stalls = 0
                 self._frame_callback(frame)
             except Exception as e:
                 _LOGGER.debug("Video stream ended: %s", e)
@@ -344,8 +396,11 @@ class CradlewiseVideoReceiver:
                 _LOGGER.debug("Audio stream ended: %s", e)
                 break
 
-    async def _keepalive_loop(self) -> None:
-        while self._pc and self._pc.connectionState not in ("closed", "failed"):
+    async def _keepalive_loop(self, pc: RTCPeerConnection) -> None:
+        # Bound to ONE session: exits as soon as that pc is replaced. (It used to
+        # check self._pc, so every past session's loop kept running — thousands
+        # of keepAlive publishes every 5 s after a day of reconnects.)
+        while pc is self._pc and pc.connectionState not in ("closed", "failed"):
             self._publish({
                 "direction": "play",
                 "command": "keepAlive",
