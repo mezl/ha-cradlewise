@@ -190,6 +190,11 @@ class CradlewiseCameraEntity(Camera):
         self._lock = Lock()
         self._jpeg: bytes | None = None
         self._receiver: CradlewiseVideoReceiver | None = None
+        # Decoded frames → JPEG on a worker thread (off the event loop).
+        self._frame_slot = None
+        self._frame_evt = threading.Event()
+        self._frame_stop = threading.Event()
+        self._frame_thread: threading.Thread | None = None
 
         # Audio streaming
         self._audio_sample_rate = 48000
@@ -218,6 +223,11 @@ class CradlewiseCameraEntity(Camera):
     async def async_added_to_hass(self) -> None:
         loop = asyncio.get_running_loop()
         self._loop = loop
+        self._frame_stop.clear()
+        self._frame_thread = threading.Thread(
+            target=self._frame_worker, name="cradlewise-jpeg", daemon=True
+        )
+        self._frame_thread.start()
         self._receiver = CradlewiseVideoReceiver(self._on_frame, self._on_audio_frame)
         self._receiver.start(loop)
         # Load YAMNet off the event loop (model init is blocking); start its worker.
@@ -240,6 +250,8 @@ class CradlewiseCameraEntity(Camera):
     async def async_will_remove_from_hass(self) -> None:
         if self._receiver:
             self._receiver.stop()
+        self._frame_stop.set()
+        self._frame_evt.set()
         self._yamnet_stop.set()
         try:
             self._yamnet_q.put_nowait(None)  # wake the worker so it can exit
@@ -288,31 +300,43 @@ class CradlewiseCameraEntity(Camera):
     # ── Frame callbacks ────────────────────────────────────────────────────────
 
     def _on_frame(self, frame) -> None:
+        """Hand the decoded frame to the JPEG worker; never block the HA loop.
+
+        Latest frame wins: if the worker is still busy, the older frame is dropped."""
+        self._frame_slot = frame
+        self._frame_evt.set()
+
+    def _frame_worker(self) -> None:
+        from PIL import ImageDraw, ImageFont
+        import time as _t
         try:
-            img = frame.to_image()
-            # Burned-in "streaming vs stalled" indicator: incrementing counter + clock.
-            # If the number/time is frozen on the crib view, the stream has stalled.
+            font = ImageFont.load_default(size=22)
+        except TypeError:
+            font = ImageFont.load_default()
+        count = 0
+        while not self._frame_stop.is_set():
+            if not self._frame_evt.wait(1.0):
+                continue
+            self._frame_evt.clear()
+            frame, self._frame_slot = self._frame_slot, None
+            if frame is None:
+                continue
             try:
-                from PIL import ImageDraw, ImageFont
-                import time as _t
-                self._frame_count = getattr(self, "_frame_count", 0) + 1
-                label = "CRIB #%d  %s" % (self._frame_count, _t.strftime("%H:%M:%S"))
-                try:
-                    font = ImageFont.load_default(size=22)
-                except TypeError:
-                    font = ImageFont.load_default()
+                img = frame.to_image()
+                # Burned-in "streaming vs stalled" indicator: incrementing counter + clock.
+                # If the number/time is frozen on the crib view, the stream has stalled.
+                count += 1
+                label = "CRIB #%d  %s" % (count, _t.strftime("%H:%M:%S"))
                 draw = ImageDraw.Draw(img)
                 for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2)):
                     draw.text((8 + dx, 8 + dy), label, fill=(0, 0, 0), font=font)
                 draw.text((8, 8), label, fill=(0, 255, 0), font=font)
-            except Exception:
-                pass
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=70)
-            with self._lock:
-                self._jpeg = buf.getvalue()
-        except Exception as e:
-            _LOGGER.debug("Frame convert error: %s", e)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=70)
+                with self._lock:
+                    self._jpeg = buf.getvalue()
+            except Exception as e:
+                _LOGGER.debug("Frame convert error: %s", e)
 
     def _on_audio_frame(self, frame) -> None:
         """Convert av.AudioFrame → s16le PCM, feed cry detector, broadcast to WAV clients."""

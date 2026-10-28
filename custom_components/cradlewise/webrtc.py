@@ -45,7 +45,9 @@ from aiortc import (
     RTCPeerConnection,
     RTCSessionDescription,
 )
+from aiortc.jitterbuffer import JitterBuffer
 from aiortc.sdp import candidate_from_sdp
+from aiortc.utils import uint16_add
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -111,6 +113,187 @@ def _make_ssl_ctx() -> ssl.SSLContext:
     return ctx
 
 
+_RCVBUF = 4 * 1024 * 1024  # host net.core.rmem_max on HAOS
+
+
+def _grow_rcvbuf(pc: RTCPeerConnection) -> None:
+    """Enlarge the ICE UDP socket buffers (default 212 KB).
+
+    The receiver runs on HA's busy event loop; a keyframe burst arriving while
+    the loop is briefly blocked overflowed the default buffer (host
+    RcvbufErrors rose together with crib packet holes)."""
+    seen = set()
+    for t in pc.getTransceivers():
+        try:
+            conn = t.receiver.transport.transport.iceGatherer._connection
+        except AttributeError:
+            continue
+        for proto in getattr(conn, "_protocols", []):
+            sock = proto.transport.get_extra_info("socket") if proto.transport else None
+            if sock is None or sock.fileno() in seen:
+                continue
+            seen.add(sock.fileno())
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _RCVBUF)
+                _LOGGER.debug("ICE socket rcvbuf now %d", sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
+            except OSError as e:
+                _LOGGER.debug("rcvbuf resize failed: %s", e)
+
+
+def _udp_rcvbuf_errors() -> int:
+    """Host-wide UDP datagrams dropped because a socket buffer was full."""
+    try:
+        with open("/proc/net/snmp") as f:
+            rows = [l.split() for l in f if l.startswith("Udp:")]
+        return int(rows[1][rows[0].index("RcvbufErrors")])
+    except Exception:
+        return 0
+
+
+class _VideoStats:
+    """Per-minute RTP/frame counters, logged as one INFO line.
+
+    Tells network loss apart from receiver stalls: aiortc releases frames in
+    strict sequence order, so one lost packet holds every later frame until it
+    is resent (NACK) or the jitter buffer overflows (then a PLI is sent)."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.t0 = time.monotonic()
+        self.pkts = 0
+        self.missing = 0     # sequence holes seen (packets not yet received)
+        self.late = 0        # older packets arriving later (resends / reordering)
+        self.pkt_gap = 0.0   # longest silence between two packets
+        self.last_pkt = 0.0
+        self.hi: int | None = None
+        self.nacks = 0
+        self.plis = 0
+        self.frames = 0
+        self.keyframes = 0
+        self.frame_gap = 0.0
+        self.gaps_1s = 0
+        self.last_frame = 0.0
+        self.cb_ms = 0.0     # worst frame-callback time (blocks the HA loop)
+        self.skips = 0       # holes given up on (fast-skip jitter buffer)
+        self.rcvbuf0 = _udp_rcvbuf_errors()
+
+    def on_packet(self, seq: int) -> None:
+        now = time.monotonic()
+        if self.last_pkt:
+            self.pkt_gap = max(self.pkt_gap, now - self.last_pkt)
+        self.last_pkt = now
+        self.pkts += 1
+        if self.hi is None:
+            self.hi = seq
+            return
+        d = (seq - self.hi) & 0xFFFF
+        if 0 < d < 0x8000:
+            self.missing += d - 1
+            self.hi = seq
+        elif d >= 0x8000:
+            self.late += 1
+
+    def on_frame(self, key: bool, cb_s: float) -> None:
+        now = time.monotonic()
+        if self.last_frame:
+            g = now - self.last_frame
+            self.frame_gap = max(self.frame_gap, g)
+            self.gaps_1s += g > 1.0
+        self.last_frame = now
+        self.frames += 1
+        self.keyframes += key
+        self.cb_ms = max(self.cb_ms, cb_s * 1000)
+
+    def line(self) -> str:
+        dt = max(time.monotonic() - self.t0, 1e-6)
+        return (
+            f"{self.frames / dt:.1f} fps, {self.keyframes} keyframes, gaps>1s {self.gaps_1s}, "
+            f"max frame gap {self.frame_gap * 1000:.0f} ms | {self.pkts} pkts, "
+            f"holes {self.missing}, late {self.late}, max pkt gap {self.pkt_gap * 1000:.0f} ms, "
+            f"nack {self.nacks}, pli {self.plis}, skips {self.skips}, host UDP rcvbuf drops "
+            f"{_udp_rcvbuf_errors() - self.rcvbuf0} | frame cb max {self.cb_ms:.0f} ms"
+        )
+
+
+_HOLE_GRACE = 0.05  # s to wait for a missing packet before giving up on it
+_PLI_EVERY = 0.5    # s between keyframe requests while waiting for one
+_START = b"\x00\x00\x00\x01"
+
+
+def _nal_types(data: bytes) -> set[int]:
+    """NAL unit types in an Annex-B blob (aiortc always writes 4-byte start codes)."""
+    types, i = set(), data.find(_START)
+    while 0 <= i < len(data) - 4:
+        types.add(data[i + 4] & 0x1F)
+        i = data.find(_START, i + 4)
+    return types
+
+
+class _FastSkipJitterBuffer(JitterBuffer):
+    """Video jitter buffer that gives up on lost packets quickly.
+
+    The crib ignores NACKs (no packet is ever resent), but aiortc's buffer holds
+    every later frame until the 128-packet ring overflows (~1.2 s at this
+    bitrate), then flushes a burst of frames. Here the broken frame is dropped
+    after _HOLE_GRACE and the frames behind it are released right away, with a
+    (rate-limited) keyframe request. Gating on a clean keyframe was tried in
+    simulation and is worse: keyframes are ~5x bigger, so under loss they break
+    too and video could freeze for 10+ s."""
+
+    def __init__(self, stats: "_VideoStats") -> None:
+        super().__init__(capacity=128, is_video=True)
+        self._stats = stats
+        self._hole_t: float | None = None
+        self._last_pli = 0.0
+
+    def _slot(self, seq: int):
+        return self._packets[seq % self._capacity]
+
+    def _stalled(self, packet) -> bool:
+        """The oldest frame is incomplete although a newer frame has started."""
+        head = self._slot(self._origin)
+        return head is None or head.timestamp != packet.timestamp
+
+    def _skip_broken_frame(self, newest: int) -> None:
+        end = uint16_add(newest, 1)
+        dropped_lead = False
+        while self._origin != end and self._slot(self._origin) is None:
+            self.remove(1)
+            dropped_lead = True
+        if self._origin == end:
+            return
+        first = self._slot(self._origin)
+        data = getattr(first, "_data", b"")
+        if dropped_lead and data.startswith(_START) and len(data) > 4 and data[4] & 0x1F in (7, 9):
+            return  # the hole ended exactly before a new access unit
+        ts = first.timestamp
+        while self._origin != end:
+            pkt = self._slot(self._origin)
+            if pkt is not None and pkt.timestamp != ts:
+                break
+            self.remove(1)
+
+    def add(self, packet):
+        pli, frame = super().add(packet)
+        now = time.monotonic()
+        if frame is not None or self._origin is None or not self._stalled(packet):
+            self._hole_t = None
+        elif self._hole_t is None:
+            self._hole_t = now
+        elif now - self._hole_t >= _HOLE_GRACE:
+            self._skip_broken_frame(packet.sequence_number)
+            self._hole_t = None
+            self._stats.skips += 1
+            frame = self._remove_frame(packet.sequence_number)
+            # Ask for a fresh keyframe so the decoder stops smearing soon.
+            pli = pli or now - self._last_pli >= _PLI_EVERY
+        if pli:
+            self._last_pli = now
+        return pli, frame
+
+
 class CradlewiseVideoReceiver:
     """Receives H264 video (and audio if offered) from the crib via WebRTC-over-MQTT."""
 
@@ -127,6 +310,7 @@ class CradlewiseVideoReceiver:
         self._last_request = 0.0    # monotonic time of the last getOffer
         self._stalls = 0            # consecutive watchdog recoveries (backoff)
         self._watchdog = None
+        self._vstats = _VideoStats()
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -244,6 +428,9 @@ class CradlewiseVideoReceiver:
         without the connection reporting failed (both seen in the field)."""
         while self._running:
             await asyncio.sleep(_WATCHDOG_INTERVAL)
+            if self._last_frame and time.monotonic() - self._vstats.t0 >= 60:
+                _LOGGER.info("Crib video: %s", self._vstats.line())
+                self._vstats.reset()
             if not self._running or self._reconnect_pending:
                 continue
             limit = min(_STALL_TIMEOUT * (2 ** self._stalls), _STALL_TIMEOUT_MAX)
@@ -277,6 +464,7 @@ class CradlewiseVideoReceiver:
             def on_track(track):
                 _LOGGER.info("Received %s track from crib", track.kind)
                 if track.kind == "video":
+                    self._instrument(pc, track)
                     asyncio.ensure_future(self._receive_video(track))
                 elif track.kind == "audio" and self._audio_callback:
                     asyncio.ensure_future(self._receive_audio(track))
@@ -306,6 +494,7 @@ class CradlewiseVideoReceiver:
                     sdp=_strip_candidates_app_shape(answer.sdp), type=answer.type
                 )
             )
+            _grow_rcvbuf(pc)
 
             local_ip = _get_local_ip_for_host(_HOST)
             self._publish({
@@ -366,6 +555,29 @@ class CradlewiseVideoReceiver:
         except Exception as e:
             _LOGGER.debug("ICE candidate error (non-fatal): %s", e)
 
+    def _instrument(self, pc: RTCPeerConnection, track) -> None:
+        """Count packets/NACKs/PLIs and install the fast-skip jitter buffer."""
+        rx = next((r for r in pc.getReceivers() if r.track is track), None)
+        if rx is None:
+            return
+        st = self._vstats
+        handle, nack, pli = rx._handle_rtp_packet, rx._send_rtcp_nack, rx._send_rtcp_pli
+
+        async def _rtp(packet, arrival_time_ms):
+            st.on_packet(packet.sequence_number)
+            return await handle(packet, arrival_time_ms)
+
+        async def _nack(media_ssrc, lost):
+            st.nacks += 1
+            return await nack(media_ssrc, lost)
+
+        async def _pli(media_ssrc):
+            st.plis += 1
+            return await pli(media_ssrc)
+
+        rx._handle_rtp_packet, rx._send_rtcp_nack, rx._send_rtcp_pli = _rtp, _nack, _pli
+        rx._RTCRtpReceiver__jitter_buffer = _FastSkipJitterBuffer(st)
+
     async def _receive_video(self, track) -> None:
         _LOGGER.info("H264 video stream started")
         while True:
@@ -373,7 +585,9 @@ class CradlewiseVideoReceiver:
                 frame = await track.recv()
                 self._last_frame = time.monotonic()
                 self._stalls = 0
+                t = time.monotonic()
                 self._frame_callback(frame)
+                self._vstats.on_frame(bool(getattr(frame, "key_frame", False)), time.monotonic() - t)
             except Exception as e:
                 _LOGGER.debug("Video stream ended: %s", e)
                 break
