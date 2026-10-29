@@ -243,8 +243,8 @@ class CradlewiseCameraEntity(Camera):
             _LOGGER.info("YAMNet cry classifier enabled")
         else:
             _LOGGER.info(
-                "YAMNet cry classifier disabled (runtime or model files missing); "
-                "DSP detector unaffected"
+                "In-component YAMNet off (no TFLite runtime in HA Core) — expected: "
+                "the cradlewise_yamnet add-on runs YAMNet; DSP detector unaffected"
             )
 
     async def async_will_remove_from_hass(self) -> None:
