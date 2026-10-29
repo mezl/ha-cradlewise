@@ -240,10 +240,13 @@ class CradlewiseCameraEntity(Camera):
                 target=self._yamnet_worker, name="cradlewise-yamnet", daemon=True
             )
             self._yamnet_thread.start()
-            _LOGGER.info("YAMNet cry classifier enabled")
+            _LOGGER.info(
+                "YAMNet cry classifier enabled (%s backend)",
+                getattr(self._yamnet, "backend", "?"),
+            )
         else:
             _LOGGER.info(
-                "YAMNet cry classifier disabled (runtime or model files missing); "
+                "YAMNet cry classifier disabled (model files missing or failed to load); "
                 "DSP detector unaffected"
             )
 

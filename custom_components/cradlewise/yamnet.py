@@ -7,8 +7,9 @@ ensembled — the DSP sensor is untouched.
 
 Design mirrors `cry_dsp.py`: the pure signal + state-machine logic (`CryClassifier`)
 has no TensorFlow / Home Assistant dependency and is unit-tested with a fake scorer.
-`YamnetScorer` is the thin TFLite wrapper; `build_default()` wires them together and
-returns ``None`` if the runtime or model files are missing — so the component still
+`YamnetScorer` is the thin TFLite wrapper (`yamnet_numpy.NumpyYamnet` is the
+dependency-free fallback); `build_default()` wires them together and returns
+``None`` if the model files are missing — so the component still
 loads (YAMNet entities simply report unavailable) and the DSP detector is unaffected.
 
 Model files (not committed; see docs/CRYWATCH_YAMNET.md to fetch, ~4 MB):
@@ -195,16 +196,37 @@ def _load_interpreter_cls():
 
 
 def build_default(component_dir: str) -> Optional[CryClassifier]:
-    """Wire a real YAMNet-backed CryClassifier, or ``None`` if runtime/model missing."""
+    """Wire a real YAMNet-backed CryClassifier, or ``None`` if model files are missing.
+
+    Uses a TFLite runtime when one is installed, else the pure-numpy port
+    (yamnet_numpy.py) — HA's musl/Python 3.14 container has no TFLite wheel."""
     model = os.path.join(component_dir, "yamnet.tflite")
+    weights = os.path.join(component_dir, "yamnet_weights.npz")
     class_map = os.path.join(component_dir, "yamnet_class_map.csv")
-    if not (os.path.exists(model) and os.path.exists(class_map)):
+    if not os.path.exists(class_map):
         return None
-    try:
-        scorer = YamnetScorer(model)
-        indices = load_class_indices(class_map)
-        if not indices:
-            return None
-        return CryClassifier(scorer, indices)
-    except Exception:
+    indices = load_class_indices(class_map)
+    if not indices:
         return None
+    scorer = None
+    if os.path.exists(model):
+        try:
+            scorer = YamnetScorer(model)
+            backend = "tflite"
+        except Exception:
+            scorer = None
+    if scorer is None and os.path.exists(weights):
+        try:
+            from .yamnet_numpy import NumpyYamnet
+        except ImportError:  # loaded outside the package (tests)
+            from yamnet_numpy import NumpyYamnet
+        try:
+            scorer = NumpyYamnet(weights)
+            backend = "numpy"
+        except Exception:
+            scorer = None
+    if scorer is None:
+        return None
+    clf = CryClassifier(scorer, indices)
+    clf.backend = backend
+    return clf
